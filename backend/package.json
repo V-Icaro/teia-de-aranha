@@ -1,0 +1,19 @@
+{
+  "name": "teia-de-aranha-backend",
+  "version": "1.0.0",
+  "description": "Backend NetFlow -> Cytoscape graph (Node + Express + Elasticsearch)",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.15.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^4.6.0",
+    "pg": "^8.23.0"
+  }
+}

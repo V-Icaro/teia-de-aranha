@@ -1,0 +1,1333 @@
+﻿require('dotenv').config();
+const net = require('node:net');
+const express = require('express');
+const cors = require('cors');
+const { client, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
+const { hostRisk, inboundFlows, newExternalPeers, isPrivate, windowStart } = require('./risk');
+const { topApplications, topKnownPorts, bandwidthForServer, criticalServiceAccess } = require('./dashboard');
+const { subnetOf, resolveMany, resolveIp } = require('./names');
+const { topTalkers } = require('./detect');
+const { checkMany, checkIp, isPublicIp, listReputationDb, coverageFor, quotaState, repTtlDays } = require('./reputation');
+const {
+  pool, init: dbInit, listSubnets, addSubnet, patchSubnet, delSubnet,
+  listInventory, inventoryApplicationsForIp, createInventoryServer, renameInventoryServer, deleteInventoryServer,
+  addServerIp, deleteServerIp, createApplication, renameApplication,
+  deleteApplication, addApplicationListener, deleteApplicationListener,
+  addExpectedApplicationClient, deleteExpectedApplicationClient,
+  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
+  saveFortigatePolicySnapshot, fortigatePolicyHistory
+} = require('./db');
+const { intParam } = require('./params.js');
+const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs } = require('./fortigate.js');
+const { analyzePolicies } = require('./firewallAnalysis.js');
+const { localDay, addDays, dayRange } = require('./time.js');
+const cron = require('node-cron');
+
+dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
+
+// A feature "Vigilância de hosts" foi removida: cadastrar host para vigiar,
+// aprender peers e gerar achados rendeu 1.126 itens não acionados em 30 dias.
+// A tela equivalente é Exposição, que não exige cadastro.
+
+// Colheita diária do histórico de IPs públicos (acumula, nunca apaga)
+if ((process.env.REGIONS_CRON || '15 6 * * *') !== '0') {
+  cron.schedule(process.env.REGIONS_CRON || '15 6 * * *', async () => {
+    try {
+      const ok = await dbInit();
+      if (!ok) return;
+      const { harvest } = require('./regions.js');
+      const r = await harvest();
+      console.log(`[regions] colheita diária: ${r.ips} IPs`);
+    } catch (e) {
+      console.error(`[regions] falha na colheita: ${e.message}`);
+    }
+  }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
+  console.log(`[regions] agendado: ${process.env.REGIONS_CRON || '15 6 * * *'}`);
+}
+
+// Série diária por par (pair_daily): alimenta o gráfico histórico da tela de
+// Reputação. Roda depois da colheita de regiões e mantém o histórico após o ES expirar.
+if ((process.env.DAILY_CRON || '40 6 * * *') !== '0') {
+  cron.schedule(process.env.DAILY_CRON || '40 6 * * *', async () => {
+    try {
+      const ok = await dbInit();
+      if (!ok) return;
+      const { harvestDaily, MAX_DAYS } = require('./daily.js');
+      const r = await harvestDaily(7);
+      console.log(`[daily] série diária: ${r.upserted} pares em ${r.days} dias (janela máx ${MAX_DAYS})`);
+    } catch (e) {
+      console.error(`[daily] falha na série diária: ${e.message}`);
+    }
+  }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
+  console.log(`[daily] agendado: ${process.env.DAILY_CRON || '40 6 * * *'}`);
+}
+
+const FORTIGATE_HISTORY_CRON = process.env.FORTIGATE_HISTORY_CRON || '15 * * * *';
+if (FORTIGATE_HISTORY_CRON !== '0') {
+  cron.schedule(FORTIGATE_HISTORY_CRON, async () => {
+    try {
+      const result = await collectFortigateSnapshots();
+      if (result.firewalls) console.log(`[fortigate] snapshots: ${result.policies} políticas em ${result.firewalls} firewall(s)`);
+    } catch (e) {
+      console.error(`[fortigate] falha ao coletar snapshots: ${e.message}`);
+    }
+  }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
+  console.log(`[fortigate] histórico agendado: ${FORTIGATE_HISTORY_CRON}`);
+}
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3001;
+// Sem teto por padrão (MAX_EDGES só como trava opcional de emergência)
+const MAX_EDGES = parseInt(process.env.MAX_EDGES || '', 10) || Infinity;
+const ACTIVE_WINDOW_SEC = parseInt(process.env.ACTIVE_WINDOW_SEC || '120', 10);
+const COMPOSITE_PAGE_SIZE = parseInt(process.env.COMPOSITE_PAGE_SIZE || '1000', 10);
+
+
+// Janela efetiva da query, para a resposta dizer a verdade. `minutes` sozinho
+// mente quando o front manda intervalo personalizado (aí não vem minutes).
+function windowOf(q) {
+  const start = windowStart(q);
+  return {
+    from: q.from || null,
+    to: q.to || null,
+    minutes: q.from ? null : intParam(q.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 }),
+    start: start ? new Date(start).toISOString() : null
+  };
+}
+
+function inventoryId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function inventoryError(res, error, fallback) {
+  const status = error.status || (error.code === '23505' ? 409 : error.code === '23503' ? 400 : 500);
+  if (status >= 500) console.error(error);
+  const message = error.status ? error.message
+    : error.code === '23505' ? 'Esse IP ou listener já está cadastrado.'
+      : error.code === '23503' ? 'A máquina ou o IP associado não existe.'
+        : fallback;
+  return res.status(status).json({ error: message, ...(status >= 500 ? { detail: String(error.message || error) } : {}) });
+}
+
+app.get('/api/dashboard/applications', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.query.serverId);
+    if (!serverId) return res.status(400).json({ error: 'Informe um serverId válido.' });
+    const window = windowOf(req.query);
+    const result = await topApplications(serverId, req.query, 5);
+    res.json({ window, ...result });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar aplicações do dashboard', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/dashboard/ports', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.query.serverId);
+    if (!serverId) return res.status(400).json({ error: 'Informe um serverId válido.' });
+    const window = windowOf(req.query);
+    const result = await topKnownPorts(serverId, req.query, 5);
+    res.json({ window, ...result });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar portas do dashboard', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/dashboard/conversations', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const top = intParam(req.query.top, { nome: 'top', def: 5, min: 1, max: 20 });
+    const timeMinutes = { '1h': 60, '6h': 360, '24h': 1440 };
+    const time = String(req.query.time || '1h');
+    if (!timeMinutes[time]) return res.status(400).json({ error: 'Time deve ser 1h, 6h ou 24h.' });
+    const flowType = String(req.query.flowType || 'ingress').toLowerCase();
+    if (!['ingress', 'egress', 'both'].includes(flowType)) {
+      return res.status(400).json({ error: 'Flow type deve ser ingress, egress ou both.' });
+    }
+
+    const inventory = await listInventory();
+    const inventoryIps = [...new Set(inventory.flatMap((server) => server.ips.map((item) => item.ip)))];
+    const query = { minutes: String(timeMinutes[time]) };
+    const window = windowOf(query);
+    if (!inventoryIps.length) {
+      return res.json({ window, top, time, flowType, inventoryIps: 0, candidates: 0, pairs: [] });
+    }
+
+    const { topo, candidatos, truncadoES } = await fetchTopPairs(query, { limit: top, inventoryIps, flowType });
+    const pairs = topo.map((group) => {
+      const higherSideSpokeMore = group.bytesAlto > group.bytesBaixo;
+      return {
+        a: group.a,
+        b: group.b,
+        bytes: Math.round(group.bytes),
+        packets: Math.round(group.pacotes || 0),
+        flows: group.fluxos,
+        mainSide: higherSideSpokeMore ? 'B>A' : 'A>B',
+        mainSideBytes: Math.round(higherSideSpokeMore ? group.bytesAlto : group.bytesBaixo),
+        secondarySideBytes: Math.round(higherSideSpokeMore ? group.bytesBaixo : group.bytesAlto),
+        start: group.inicio,
+        end: group.fim,
+        ...conversationDirection(group),
+        protocols: [...group.protocolos].map(protocolName),
+        topPorts: [...group.portas.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 5)
+          .map((port) => ({ port: port.port, bytes: Math.round(port.bytes) }))
+      };
+    });
+    res.json({ window, top, time, flowType, inventoryIps: inventoryIps.length, candidates: candidatos, truncated: truncadoES, pairs });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar conversas do inventário', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/dashboard/bandwidth', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.query.serverId);
+    if (!serverId) return res.status(400).json({ error: 'Informe um serverId válido.' });
+    const period = String(req.query.period || '1h');
+    const groupBy = String(req.query.groupBy || 'server');
+    res.json(await bandwidthForServer(serverId, period, groupBy));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar série de banda', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/dashboard/critical-access', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const days = intParam(req.query.days, { nome: 'days', def: 30, min: 30, max: 365 });
+    if (![30, 90, 365].includes(days)) return res.status(400).json({ error: 'days deve ser 30, 90 ou 365.' });
+    res.json(await criticalServiceAccess(days));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar acessos críticos', detail: String(e.message || e) });
+  }
+});
+
+// FortiGate: token cifrado no Postgres e nunca devolvido pela API.
+app.get('/api/fortigate', async (_req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    res.json({ firewalls: await listFortigates() });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao listar FortiGates', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/fortigate', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const firewall = await createFortigate({ name: req.body?.name, host: req.body?.host, vdom: req.body?.vdom, token: req.body?.token });
+    res.status(201).json({ firewall });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao cadastrar FortiGate', detail: String(e.message || e) });
+  }
+});
+
+app.patch('/api/fortigate/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const firewall = await updateFortigate(id, {
+      ...(req.body?.name !== undefined ? { name: req.body.name } : {}),
+      ...(req.body?.host !== undefined ? { host: req.body.host } : {}),
+      ...(req.body?.vdom !== undefined ? { vdom: req.body.vdom } : {}),
+      ...(req.body?.token !== undefined ? { token: req.body.token } : {})
+    });
+    res.json({ firewall });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao atualizar FortiGate', detail: String(e.message || e) });
+  }
+});
+
+app.delete('/api/fortigate/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    res.json(await deleteFortigate(id));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao remover FortiGate', detail: String(e.message || e) });
+  }
+});
+
+async function fortigateCredentials(id) {
+  const firewall = await getFortigate(id);
+  if (!firewall) throw Object.assign(new Error('FortiGate não encontrado.'), { status: 404 });
+  return { firewall, credentials: { host: firewall.host, token: firewall.token, vdom: firewall.vdom || 'root' } };
+}
+
+async function captureFortigateSnapshot(id) {
+  const { credentials } = await fortigateCredentials(id);
+  const result = await fetchPolicies(credentials);
+  return saveFortigatePolicySnapshot(id, result.policies, new Date());
+}
+
+async function collectFortigateSnapshots() {
+  if (!(await dbInit())) throw new Error('Postgres indisponível');
+  const firewalls = await listFortigates();
+  let policies = 0;
+  for (const firewall of firewalls) {
+    try {
+      const snapshot = await captureFortigateSnapshot(firewall.id);
+      policies += snapshot.policies;
+    } catch (e) {
+      console.error(`[fortigate] snapshot falhou para ${firewall.name} (${firewall.host}): ${e.message}`);
+    }
+  }
+  return { firewalls: firewalls.length, policies };
+}
+
+app.post('/api/fortigate/:id/test', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { firewall, credentials } = await fortigateCredentials(id);
+    const result = await fetchPolicies(credentials);
+    res.json({ ok: true, id, name: firewall.name, host: firewall.host, version: result.version, vdom: result.vdom, policies: result.policies.length });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao testar FortiGate', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/fortigate/:id/snapshot', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    res.json(await captureFortigateSnapshot(id));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao coletar snapshot FortiGate', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate/:id/history', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { firewall } = await fortigateCredentials(id);
+    let from;
+    let to;
+    if (req.query.from !== undefined || req.query.to !== undefined) {
+      const fromDay = String(req.query.from || '');
+      const toDay = String(req.query.to || '');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDay) || !/^\d{4}-\d{2}-\d{2}$/.test(toDay)) {
+        return res.status(400).json({ error: 'from e to devem estar no formato YYYY-MM-DD.' });
+      }
+      const fromUtcDay = new Date(`${fromDay}T00:00:00Z`);
+      const toUtcDay = new Date(`${toDay}T00:00:00Z`);
+      if (Number.isNaN(fromUtcDay.getTime()) || Number.isNaN(toUtcDay.getTime())
+        || fromUtcDay.toISOString().slice(0, 10) !== fromDay || toUtcDay.toISOString().slice(0, 10) !== toDay) {
+        return res.status(400).json({ error: 'from/to não são datas válidas.' });
+      }
+      if (fromDay > toDay) return res.status(400).json({ error: 'from não pode ser posterior a to.' });
+      if ((toUtcDay.getTime() - fromUtcDay.getTime()) / 86400000 + 1 > 90) {
+        return res.status(400).json({ error: 'O intervalo personalizado não pode exceder 90 dias.' });
+      }
+      from = dayRange(fromDay).start;
+      to = dayRange(toDay).end;
+    } else {
+      const days = intParam(req.query.days, { nome: 'days', def: 30, min: 1, max: 90 });
+      const firstDay = addDays(localDay(new Date()), -(days - 1));
+      from = dayRange(firstDay).start;
+      to = new Date().toISOString();
+    }
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 100, min: 1, max: 500 });
+    const offset = intParam(req.query.offset, { nome: 'offset', def: 0, min: 0, max: Number.MAX_SAFE_INTEGER });
+    const sort = ['bytes', 'hits', 'packets', 'position'].includes(String(req.query.sort)) ? String(req.query.sort) : 'bytes';
+    const history = await fortigatePolicyHistory(id, { from, to, sort, limit, offset });
+    res.json({ firewall: { id, name: firewall.name, host: firewall.host, vdom: firewall.vdom }, ...history });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar histórico FortiGate', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate/:id/policies', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 20, min: 1, max: 100 });
+    const offset = intParam(req.query.offset, { nome: 'offset', def: 0, min: 0, max: Number.MAX_SAFE_INTEGER });
+    const sort = ['hits', 'bytes', 'packets', 'sessions'].includes(String(req.query.sort)) ? String(req.query.sort) : 'hits';
+    const { credentials } = await fortigateCredentials(id);
+    const vdom = String(req.query.vdom || credentials.vdom || 'root').trim() || 'root';
+    res.json(await topPolicies({ ...credentials, vdom }, { limit, offset, sort }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar políticas', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate/:id/policy/:policyId', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const policyId = intParam(req.params.policyId, { nome: 'policyId', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { credentials } = await fortigateCredentials(id);
+    const vdom = String(req.query.vdom || credentials.vdom || 'root').trim() || 'root';
+    res.json(await fetchPolicyDetail({ ...credentials, policyId, vdom }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar detalhe da política', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate/:id/analysis', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const staleDays = intParam(req.query.staleDays, { nome: 'staleDays', def: 90, min: 1, max: 3650 });
+    const { credentials } = await fortigateCredentials(id);
+    const vdom = String(req.query.vdom || credentials.vdom || 'root').trim() || 'root';
+    const [configs, stats] = await Promise.all([
+      fetchPolicyConfigs({ ...credentials, vdom }),
+      fetchPolicies(credentials)
+    ]);
+    res.json({ ...analyzePolicies({ configs: configs.configs, stats: stats.policies, options: { staleDays } }), vdom });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao analisar políticas FortiGate', detail: String(e.message || e) });
+  }
+});
+
+// Health: verifica se o ES responde
+app.get('/api/health', async (req, res) => {
+  try {
+    const ping = await client.ping();
+    res.json({ ok: true, elastic: ELASTIC_INDEX, ping, build: '2026-09-29d' });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Grafo principal p/ o React + Cytoscape
+// Ex: /api/graph?minutes=15 | /api/graph?minutes=60 | /api/graph?from=...&to=...
+// ?names=1 — enriquece nós com { name, subnet } via inventário + rDNS
+app.get('/api/graph', async (req, res) => {
+  try {
+    const buckets = await fetchConnections(req.query, {
+      pageSize: COMPOSITE_PAGE_SIZE,
+      maxEdges: MAX_EDGES
+    });
+    const graph = toCytoscape(buckets);
+    if (req.query.names === '1') {
+      const ips = graph.nodes.map((n) => n.data.id);
+      const { names, info } = await resolveMany(ips);
+      for (const n of graph.nodes) {
+        n.data.subnet = subnetOf(n.data.id);
+        if (names[n.data.id]) n.data.name = names[n.data.id];
+        const extra = info[n.data.id];
+        if (extra) { n.data.asn = extra.asn; n.data.org = extra.org; n.data.prefix = extra.prefix; }
+        const show = n.data.name || n.data.org;
+        if (show) n.data.label = `${show}\n${n.data.id}`;
+      }
+    } else {
+      for (const n of graph.nodes) n.data.subnet = subnetOf(n.data.id);
+    }
+    res.json({
+      ...graph,
+      meta: {
+        edges: graph.edges.length,
+        nodes: graph.nodes.length,
+        truncated: buckets.truncated || false,
+        minutes: req.query.minutes || null,
+        from: req.query.from || null,
+        to: req.query.to || null,
+        range: req.query.range || null
+      }
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao consultar Elasticsearch', detail: String(e.message || e) });
+  }
+});
+
+// Resolução de nomes sob demanda: POST { "ips": ["8.8.8.8", ...] }
+// -> { names: {...}, info: { "8.8.8.8": { asn, org, prefix } }, subnets: {...} }
+app.post('/api/resolve', async (req, res) => {
+  try {
+    const ips = Array.isArray(req.body?.ips) ? req.body.ips.filter((x) => typeof x === 'string') : [];
+    if (!ips.length) return res.status(400).json({ error: 'Envie { "ips": [...] }' });
+    // Aguarda o DDL inicial para o inventário PostgreSQL participar já da
+    // primeira resolução de nomes após o backend subir.
+    await dbInit();
+    const { names, info } = await resolveMany(ips.slice(0, 2000));
+    const subnets = {};
+    for (const ip of new Set(ips)) subnets[ip] = subnetOf(ip);
+    res.json({ names, info, subnets });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: 'Falha ao resolver nomes', detail: String(e.message || e) });
+  }
+});
+
+// Detalhe de um host ao clicar no nó:
+// Ex: /api/host/172.20.20.28?minutes=15
+app.get('/api/host/:ip', async (req, res) => {
+  try {
+    const { ip } = req.params;
+    const activeOnly = req.query.active === '1';
+    const nowMs = Date.now();
+    const buckets = await fetchConnections(req.query, {
+      pageSize: COMPOSITE_PAGE_SIZE,
+      maxEdges: MAX_EDGES,
+      ip, // filtra no ES: só fluxos do host + mantém porta_orig (volume pequeno)
+      withSport: true,
+      withTimes: true, // firstSeen/lastSeen por par (coluna ESTADO)
+      activeSec: activeOnly ? ACTIVE_WINDOW_SEC : null
+    });
+
+    const mine = buckets; // já filtrado no ES
+
+    let outBytes = 0;
+    let inBytes = 0;
+    let outPackets = 0;
+    let inPackets = 0;
+    const peers = {};
+
+    for (const b of mine) {
+      const bytes = b.bytes?.value || 0;
+      const pkts = b.pacotes?.value || 0;
+      const isSrc = String(b.key.origem) === ip;
+      const peer = isSrc ? String(b.key.destino) : String(b.key.origem);
+      if (isSrc) { outBytes += bytes; outPackets += pkts; }
+      else { inBytes += bytes; inPackets += pkts; }
+      if (!peers[peer]) peers[peer] = { ip: peer, bytes: 0, packets: 0, outBytes: 0, inBytes: 0, firstSeen: null, lastSeen: 0, outPairs: new Map(), inPairs: new Map(), srcPorts: new Set(), dstPorts: new Set(), ports: new Set(), protocols: new Set() };
+      peers[peer].bytes += bytes;
+      peers[peer].packets += pkts;
+      if (isSrc) peers[peer].outBytes += bytes; else peers[peer].inBytes += bytes;
+      // Pares sport→dport por direção (top 5 de cada lado na tabela)
+      const pk = `${b.key.porta_orig ?? '?'}>${b.key.porta_dest ?? '?'}`;
+      const pm = isSrc ? peers[peer].outPairs : peers[peer].inPairs;
+      const pe = pm.get(pk) || { sport: b.key.porta_orig ?? null, dport: b.key.porta_dest ?? null, bytes: 0, flows: 0 };
+      pe.bytes += bytes; pe.flows += 1;
+      pm.set(pk, pe);
+      const fs = b.firstSeen?.value_as_string ? Date.parse(b.firstSeen.value_as_string) : (b.firstSeen?.value || null);
+      const ls = b.lastSeen?.value_as_string ? Date.parse(b.lastSeen.value_as_string) : (b.lastSeen?.value || null);
+      if (fs && (!peers[peer].firstSeen || fs < peers[peer].firstSeen)) peers[peer].firstSeen = fs;
+      if (ls && ls > peers[peer].lastSeen) peers[peer].lastSeen = ls;
+      if (b.key.porta_orig) { peers[peer].srcPorts.add(b.key.porta_orig); }
+      if (b.key.porta_dest) { peers[peer].dstPorts.add(b.key.porta_dest); peers[peer].ports.add(b.key.porta_dest); }
+      if (b.key.protocolo !== undefined) peers[peer].protocols.add(b.key.protocolo);
+    }
+
+    const topPairs = (m) => [...m.values()]
+      .sort((x, y) => y.bytes - x.bytes).slice(0, 5)
+      .map((x) => ({ sport: x.sport, dport: x.dport, bytes: Math.round(x.bytes), flows: x.flows }));
+    const connections = Object.values(peers)
+      .map((p) => {
+        return {
+          ...p,
+          outPairs: undefined, inPairs: undefined, // Maps internos, fora do JSON
+          bytes: Math.round(p.bytes),
+          outBytes: Math.round(p.outBytes),
+          inBytes: Math.round(p.inBytes),
+          firstSeen: p.firstSeen ? new Date(p.firstSeen).toISOString() : null,
+          lastSeen: p.lastSeen ? new Date(p.lastSeen).toISOString() : null,
+          active: !!p.lastSeen && (nowMs - p.lastSeen) <= ACTIVE_WINDOW_SEC * 1000,
+          outTop: topPairs(p.outPairs),
+          inTop: topPairs(p.inPairs),
+          srcPorts: rankPorts([...p.srcPorts]), dstPorts: rankPorts([...p.dstPorts]), ports: rankPorts([...p.ports]), protocols: [...p.protocols].map(protocolName)
+        };
+      })
+      .sort((a, b) => b.bytes - a.bytes)
+      .slice(0, 100);
+
+    // Com filtro "ativas", conta quantos peers existem na janela cheia p/ avisar o que ficou oculto
+    let windowPeers = null;
+    if (activeOnly) {
+      try {
+        const range = req.query.from
+          ? { '@timestamp': { gte: req.query.from, ...(req.query.to ? { lte: req.query.to } : {}) } }
+          : { '@timestamp': { gte: `now-${intParam(req.query.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 })}m` } };
+        const pc = await client.search({ index: ELASTIC_INDEX, size: 0,
+          query: { bool: { filter: [{ range }, { bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 } }] } },
+          aggs: { s: { terms: { field: F_SRC, size: 2000 } }, d: { terms: { field: F_DST, size: 2000 } } } });
+        const set = new Set([
+          ...(pc.aggregations?.s?.buckets || []).map((x) => x.key),
+          ...(pc.aggregations?.d?.buckets || []).map((x) => x.key)
+        ]);
+        set.delete(ip);
+        windowPeers = set.size;
+      } catch { /* sem contagem, sem aviso */ }
+    }
+
+    const inventory = await inventoryApplicationsForIp(ip).catch(() => null);
+    res.json({
+      ip,
+      inventory,
+      activeOnly,
+      windowPeers,
+      totalInBytes: Math.round(inBytes),
+      totalOutBytes: Math.round(outBytes),
+      totalInPackets: Math.round(inPackets),
+      totalOutPackets: Math.round(outPackets),
+      connections
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao consultar host', detail: String(e.message || e) });
+  }
+});
+
+// Maiores falantes da janela. Ex: /api/alerts?minutes=15
+app.get('/api/alerts', async (req, res) => {
+  try {
+    const minutes = intParam(req.query.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 });
+    const now = Date.now();
+    let curFrom, curTo;
+    if (req.query.from) {
+      curFrom = req.query.from;
+      curTo = req.query.to || new Date(now).toISOString();
+    } else {
+      curTo = new Date(now).toISOString();
+      curFrom = new Date(now - minutes * 60000).toISOString();
+    }
+
+    const current = await fetchConnections({ from: curFrom, to: curTo }, {
+      pageSize: COMPOSITE_PAGE_SIZE, maxEdges: MAX_EDGES
+    });
+
+    res.json({
+      topTalkers: topTalkers(current),
+      meta: { window: { from: curFrom, to: curTo } }
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha nos top talkers', detail: String(e.message || e) });
+  }
+});
+
+// Exposição a IP malicioso por host: bytes que foram para score>0, ponderados.
+// Cruza ES (par + bytes) com Postgres (score já em cache) — sem chamar a API.
+// Ex: /api/risk?minutes=60&limit=50
+app.get('/api/risk', async (req, res) => {
+  try {
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 50, min: 1, max: 500 });
+    const { rows, truncated, reputacao, reputationCoverage, erro } = await hostRisk(req.query, { maxPairs: 12000 });
+    const only = String(req.query.only || '').toLowerCase();
+    let list = rows;
+    // Não esconder host com reputação desconhecida sob o filtro "withbad":
+    // ele precisa aparecer como avaliação parcial, nunca como limpo.
+    if (only === 'withbad') list = rows.filter((r) => r.badPeers > 0 || r.unknownPeers > 0 || r.level === 'indisponivel');
+    else if (only === 'clean') list = rows.filter((r) => r.badPeers === 0 && r.unknownPeers === 0 && r.level === 'none');
+    res.json({
+      minutes: intParam(req.query.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 }),
+      window: windowOf(req.query),
+      hosts: list.slice(0, limit),
+      total: rows.length,
+      matches: list.length,
+      shown: Math.min(list.length, limit),
+      withBad: rows.filter((r) => r.badPeers > 0).length,
+      withUnknown: rows.filter((r) => r.unknownPeers > 0 || r.level === 'indisponivel').length,
+      byLevel: rows.reduce((a, r) => { a[r.level] = (a[r.level] || 0) + 1; return a; }, {}),
+      processingTruncated: truncated,
+      truncated: truncated || list.length > limit,
+      reputacao,
+      reputationCoverage,
+      ...(erro ? { reputationError: erro } : {})
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao calcular risco', detail: String(e.message || e) });
+  }
+});
+
+// Só os pares interno→externo que NÃO existiam no histórico acumulado.
+// "Destino nunca visto" é o achado mais forte que o NetFlow entrega sozinho.
+// Ex: /api/new-external?minutes=60&onlyNew=1
+app.get('/api/new-external', async (req, res) => {
+  try {
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 100, min: 1, max: 500 });
+    const { rows, total, newTotal, newIpCount, confirmedNewCount, candidateCount, historySince, historyUpdatedAt, truncated, historico, reputacao, reputationCoverage, novelty } = await newExternalPeers(req.query, { maxPairs: 8000 });
+    const onlyNew = String(req.query.onlyNew || '') === '1';
+    const list = onlyNew ? rows.filter((r) => r.new) : rows;
+    res.json({
+      minutes: intParam(req.query.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 }),
+      window: windowOf(req.query),
+      pairs: list.slice(0, limit),
+      total,
+      matches: list.length,
+      shown: Math.min(list.length, limit),
+      newCount: newTotal,
+      newIpCount,
+      confirmedNewCount,
+      candidateCount,
+      // 'indisponivel' = o Postgres não respondeu e "nunca visto" não pôde ser
+      // afirmado. A tela usa isso para não apresentar falha de leitura como
+      // descoberta.
+      historico,
+      historySince,
+      historyUpdatedAt,
+      reputacao,
+      reputationCoverage,
+      novelty,
+      processingTruncated: truncated,
+      truncated: truncated || list.length > limit
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao listar destinos novos', detail: String(e.message || e) });
+  }
+});
+
+// Tráfego público -> interno, incluindo protocolos que não são TCP/UDP.
+// Separado do risco de saída: um fluxo de entrada não é o mesmo sinal que um
+// host interno falando com um destino de má reputação.
+app.get('/api/inbound', async (req, res) => {
+  try {
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 200, min: 1, max: 500 });
+    const { rows, total, truncated, bucketsRead } = await inboundFlows(req.query, { maxBuckets: 20000 });
+    res.json({
+      window: windowOf(req.query),
+      flows: rows.slice(0, limit).map((r) => ({ ...r, protocolName: protocolName(r.protocol) })),
+      total,
+      shown: Math.min(total, limit),
+      nonTransportCount: rows.filter((r) => r.nonTransport).length,
+      processingTruncated: truncated,
+      truncated: truncated || total > limit,
+      bucketsRead
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao listar tráfego de entrada', detail: String(e.message || e) });
+  }
+});
+
+// Sessões vivas: pares com fluxo ativo na janela + nome do serviço.
+// NÃO é "conexão aberta" — NetFlow não tem estado. É o par que teve pacote
+// nos últimos N segundos, que é o mais perto de sessão que o formato dá.
+// Ex: /api/sessions?minutes=15&activeSec=120
+app.get('/api/sessions', async (req, res) => {
+  try {
+    const activeSec = intParam(req.query.activeSec, { nome: 'activeSec', def: 120, min: 1, max: 3600 });
+    const { buckets, truncated } = await fetchSessions(req.query, { activeSec });
+    const rows = buckets.map((b) => {
+      const src = String(b.key.origem);
+      const dst = String(b.key.destino);
+      const ports = (b.portas?.buckets || []).map((p) => ({ port: p.key, service: portName(p.key), bytes: Math.round(p.bytes?.value || 0) }));
+      const fs = b.firstSeen?.value_as_string ? Date.parse(b.firstSeen.value_as_string) : null;
+      const ls = b.lastSeen?.value_as_string ? Date.parse(b.lastSeen.value_as_string) : null;
+      const durMs = fs && ls ? Math.max(0, ls - fs) : null;
+      const bytes = b.bytes?.value || 0;
+      return {
+        src, dst,
+        direction: isPrivate(src) ? 'out' : 'in',
+        bytes: Math.round(bytes),
+        packets: Math.round(b.packets?.value || 0),
+        firstSeen: fs ? new Date(fs).toISOString() : null,
+        lastSeen: ls ? new Date(ls).toISOString() : null,
+        durationSec: durMs != null ? Math.round(durMs / 1000) : null,
+        // bps só faz sentido com duração > 0; senão é infinito/ruim
+        bps: durMs > 0 ? Math.round((bytes * 8) / (durMs / 1000)) : null,
+        service: ports.find((p) => p.service)?.service || null,
+        ports: ports.slice(0, 5)
+      };
+    }).sort((a, b) => b.bytes - a.bytes);
+
+    const sessions = rows.slice(0, 300);
+    res.json({ activeSec, sessions, count: rows.length, shown: sessions.length, truncated: truncated || rows.length > sessions.length });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao listar sessões', detail: String(e.message || e) });
+  }
+});
+
+// Perfil de periodicidade de UM par (beacon/C2). Consulta com hits, então só
+// para o par que o usuário escolheu — nunca varre o índice.
+// Ex: /api/beacon?src=172.20.20.28&dst=1.2.3.4&minutes=240
+app.get('/api/beacon', async (req, res) => {
+  try {
+    const { src, dst } = req.query;
+    if (!src || !dst) return res.status(400).json({ error: 'Informe src e dst' });
+    const minutes = intParam(req.query.minutes, { nome: 'minutes', def: 240, min: 1, max: 10080 });
+    res.json({ src, dst, minutes, ...(await fetchBeaconProfile({ src, dst, minutes })) });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao medir periodicidade', detail: String(e.message || e) });
+  }
+});
+
+// Só o que JÁ está em memória/Postgres: não chama o AbuseIPDB, não gasta cota.
+// O front usa para pintar a lista na hora e o botão para dizer quantos IPs
+// realmente precisam de consulta.
+// POST { "ips": [...] } -> { coverage: { ip: { cached, stale, from, ageDays, result } }, quota, ttlDays }
+app.post('/api/reputation/coverage', async (req, res) => {
+  try {
+    const ips = Array.isArray(req.body?.ips) ? req.body.ips.filter((x) => typeof x === 'string') : [];
+    if (!ips.length) return res.status(400).json({ error: 'Envie { "ips": [...] }' });
+    res.json({ coverage: await coverageFor(ips), quota: quotaState(), ttlDays: repTtlDays() });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: 'Falha ao ler a cobertura de reputação', detail: String(e.message || e) });
+  }
+});
+
+// Reputação de IPs públicos (só AbuseIPDB): POST { "ips": [...] }
+// -> { rep: { "8.8.8.8": { verdict, sources, abuse } } }
+// verdict: clean (score 0, verde) | malicious (score > 0, vermelho) | unknown | private
+app.post('/api/reputation', async (req, res) => {
+  try {
+    const ips = Array.isArray(req.body?.ips) ? req.body.ips.filter((x) => typeof x === 'string') : [];
+    if (!ips.length) return res.status(400).json({ error: 'Envie { "ips": [...] }' });
+    res.json({ rep: await checkMany(ips) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: 'Falha na reputação', detail: String(e.message || e) });
+  }
+});
+
+// Dossiê completo de um IP: identidade + reputação + tráfego na janela
+// Ex: /api/ip/8.8.8.8?minutes=15
+app.get('/api/ip/:ip', async (req, res) => {
+  try {
+    const { ip } = req.params;
+    await dbInit();
+    const [identity, rep, buckets, inventory] = await Promise.all([
+      resolveIp(ip).catch(() => ({ ip, name: null, source: 'none', asn: null, org: null, prefix: null })),
+      checkIp(ip).catch(() => ({ ip, verdict: 'unknown', sources: [] })),
+      fetchConnections(req.query, {
+        pageSize: COMPOSITE_PAGE_SIZE,
+        maxEdges: MAX_EDGES,
+        ip,
+        withSport: true
+      }).catch(() => []),
+      inventoryApplicationsForIp(ip).catch(() => null)
+    ]);
+
+    let inBytes = 0, outBytes = 0, inPackets = 0, outPackets = 0, flows = 0;
+    const peers = {};
+    const dports = {};
+    for (const b of buckets) {
+      const bytes = b.bytes?.value || 0;
+      const pkts = b.pacotes?.value || 0;
+      const isSrc = String(b.key.origem) === ip;
+      const peer = isSrc ? String(b.key.destino) : String(b.key.origem);
+      flows += 1;
+      if (isSrc) { outBytes += bytes; outPackets += pkts; } else { inBytes += bytes; inPackets += pkts; }
+      const dp = b.key.porta_dest ?? null;
+      dports[dp] = dports[dp] || { port: dp, bytes: 0, flows: 0 };
+      dports[dp].bytes += bytes; dports[dp].flows += 1;
+      peers[peer] = peers[peer] || { ip: peer, bytes: 0, flows: 0, ports: new Set() };
+      peers[peer].bytes += bytes; peers[peer].flows += 1;
+      if (dp != null) peers[peer].ports.add(dp);
+    }
+
+    res.json({
+      ip,
+      public: isPublicIp(ip),
+      subnet: subnetOf(ip),
+      name: identity.name || null,
+      nameSource: identity.source || 'none',
+      asn: identity.asn ?? null,
+      org: identity.org || null,
+      prefix: identity.prefix || null,
+      inventory,
+      reputation: rep,
+      traffic: {
+        inBytes: Math.round(inBytes),
+        outBytes: Math.round(outBytes),
+        inPackets: Math.round(inPackets),
+        outPackets: Math.round(outPackets),
+        flows,
+        topPeers: Object.values(peers)
+          .map((p) => ({ ip: p.ip, bytes: Math.round(p.bytes), flows: p.flows, ports: [...p.ports].slice(0, 10) }))
+          .sort((a, b) => b.bytes - a.bytes).slice(0, 10),
+        topPorts: Object.values(dports)
+          .map((d) => ({ port: d.port, bytes: Math.round(d.bytes), flows: d.flows }))
+          .sort((a, b) => b.bytes - a.bytes).slice(0, 10)
+      }
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha no dossiê do IP', detail: String(e.message || e) });
+  }
+});
+
+// Comparador de dois hosts: DIREÇÕES, timeline e top portas do par
+// Ex: /api/compare?a=10.1.0.11&b=172.20.20.28&minutes=60
+app.get('/api/compare', async (req, res) => {
+  try {
+    const { a, b } = req.query;
+    if (!a || !b) return res.status(400).json({ error: 'Envie ?a=IP&b=IP' });
+    if (a === b) return res.status(400).json({ error: 'IPs iguais' });
+    const minutes = intParam(req.query.minutes, { nome: 'minutes', def: 60, min: 1, max: 10080 });
+    const now = Date.now();
+    const to = req.query.to || new Date(now).toISOString();
+    const from = req.query.from || new Date(now - minutes * 60000).toISOString();
+
+    // Fluxos do par (1 consulta filtrada em A, fatia o peer B no código)
+    const buckets = await fetchConnections({ from, to }, {
+      pageSize: COMPOSITE_PAGE_SIZE, maxEdges: MAX_EDGES, ip: a, withSport: true
+    });
+    const pair = buckets.filter((x) => String(x.key.origem) === b || String(x.key.destino) === b);
+
+    const dir = {
+      aToB: { bytes: 0, packets: 0, flows: 0, ports: {} },
+      bToA: { bytes: 0, packets: 0, flows: 0, ports: {} }
+    };
+    for (const x of pair) {
+      const fwd = String(x.key.origem) === a; // A->B ?
+      const d = fwd ? dir.aToB : dir.bToA;
+      const bytes = x.bytes?.value || 0;
+      d.bytes += bytes; d.packets += x.pacotes?.value || 0; d.flows += 1;
+      const p = x.key.porta_dest ?? 'null';
+      d.ports[p] = d.ports[p] || { port: x.key.porta_dest ?? null, bytes: 0, flows: 0 };
+      d.ports[p].bytes += bytes; d.ports[p].flows += 1;
+    }
+    const fmtDir = (d) => ({
+      bytes: Math.round(d.bytes), packets: Math.round(d.packets), flows: d.flows,
+      topPorts: Object.values(d.ports).map((p) => ({ port: p.port, bytes: Math.round(p.bytes), flows: p.flows }))
+        .sort((x, y) => y.bytes - x.bytes).slice(0, 10)
+    });
+
+    // Timeline: 1 consulta com 2 filtros (A->B e B->A)
+    const interval = minutes <= 30 ? '1m' : minutes <= 180 ? '5m' : minutes <= 720 ? '15m' : '1h';
+    const range = { '@timestamp': { gte: from, lte: to } };
+    const t = await client.search({ index: ELASTIC_INDEX, size: 0, query: { bool: { filter: [{ range }] } },
+      aggs: {
+        aToB: { filter: { bool: { filter: [
+          { term: { [process.env.ELASTIC_FIELD_SRC || 'netflow.sourceIPv4Address.keyword']: a } },
+          { term: { [process.env.ELASTIC_FIELD_DST || 'netflow.destinationIPv4Address.keyword']: b } }
+        ] } }, aggs: { over: { date_histogram: { field: '@timestamp', fixed_interval: interval },
+          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } } } },
+        bToA: { filter: { bool: { filter: [
+          { term: { [process.env.ELASTIC_FIELD_SRC || 'netflow.sourceIPv4Address.keyword']: b } },
+          { term: { [process.env.ELASTIC_FIELD_DST || 'netflow.destinationIPv4Address.keyword']: a } }
+        ] } }, aggs: { over: { date_histogram: { field: '@timestamp', fixed_interval: interval },
+          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } } } }
+      } });
+    const ba = Object.fromEntries(t.aggregations.bToA.over.buckets.map((x) => [x.key, Math.round(x.bytes.value || 0)]));
+    const timeline = t.aggregations.aToB.over.buckets.map((x) => ({
+      t: x.key_as_string, aToB: Math.round(x.bytes.value || 0), bToA: ba[x.key] || 0
+    }));
+
+    res.json({ a, b, from, to, interval,
+      aToB: fmtDir(dir.aToB), bToA: fmtDir(dir.bToA), timeline });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao comparar', detail: String(e.message || e) });
+  }
+});
+
+// ---- inventário de máquinas, IPs e aplicações ----------------------
+app.get('/api/inventory', async (_req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    res.json({ servers: await listInventory() });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao listar o inventário');
+  }
+});
+
+app.post('/api/inventory/servers', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const name = String(req.body?.name || '').trim();
+    const ips = [...new Set((Array.isArray(req.body?.ips) ? req.body.ips : [])
+      .map((ip) => String(ip).trim()).filter(Boolean))];
+    if (!name || name.length > 128) return res.status(400).json({ error: 'Informe o nome da máquina (máximo 128 caracteres).' });
+    if (!ips.length) return res.status(400).json({ error: 'Cadastre pelo menos um IP para a máquina.' });
+    if (ips.some((ip) => !net.isIP(ip))) return res.status(400).json({ error: 'Um ou mais IPs são inválidos.' });
+    const server = await createInventoryServer(name, ips);
+    res.status(201).json({ server });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao cadastrar máquina');
+  }
+});
+
+app.patch('/api/inventory/servers/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    const name = String(req.body?.name || '').trim();
+    if (!id) return res.status(400).json({ error: 'ID de máquina inválido.' });
+    if (!name || name.length > 128) return res.status(400).json({ error: 'Informe o nome da máquina (máximo 128 caracteres).' });
+    res.json({ server: await renameInventoryServer(id, name) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao renomear máquina');
+  }
+});
+
+app.delete('/api/inventory/servers/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de máquina inválido.' });
+    res.json(await deleteInventoryServer(id));
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao remover máquina');
+  }
+});
+
+app.post('/api/inventory/servers/:id/ips', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.params.id);
+    const ip = String(req.body?.ip || '').trim();
+    if (!serverId) return res.status(400).json({ error: 'ID de máquina inválido.' });
+    if (!net.isIP(ip)) return res.status(400).json({ error: 'IP inválido.' });
+    res.status(201).json({ ip: await addServerIp(serverId, ip) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao adicionar IP');
+  }
+});
+
+app.delete('/api/inventory/ips/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de IP inválido.' });
+    res.json(await deleteServerIp(id));
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao remover IP');
+  }
+});
+
+app.post('/api/inventory/servers/:id/applications', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.params.id);
+    const name = String(req.body?.name || '').trim();
+    const listeners = Array.isArray(req.body?.listeners) ? req.body.listeners : [];
+    if (!serverId) return res.status(400).json({ error: 'ID de máquina inválido.' });
+    if (!name || name.length > 128) return res.status(400).json({ error: 'Informe o nome da aplicação (máximo 128 caracteres).' });
+    if (!listeners.length || listeners.length > 100) return res.status(400).json({ error: 'Informe entre 1 e 100 listeners.' });
+    const clean = [];
+    for (const listener of listeners) {
+      const serverIpId = inventoryId(listener?.serverIpId);
+      const protocol = String(listener?.protocol || '').toUpperCase();
+      const port = Number(listener?.port);
+      if (!serverIpId || !['TCP', 'UDP'].includes(protocol) || !Number.isInteger(port) || port < 1 || port > 65535) {
+        return res.status(400).json({ error: 'Listener inválido: selecione IP, protocolo TCP/UDP e porta 1–65535.' });
+      }
+      clean.push({ serverIpId, protocol, port });
+    }
+    res.status(201).json({ application: await createApplication(serverId, name, clean) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao cadastrar aplicação');
+  }
+});
+
+app.patch('/api/inventory/applications/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    const name = String(req.body?.name || '').trim();
+    if (!id) return res.status(400).json({ error: 'ID de aplicação inválido.' });
+    if (!name || name.length > 128) return res.status(400).json({ error: 'Informe o nome da aplicação (máximo 128 caracteres).' });
+    res.json({ application: await renameApplication(id, name) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao renomear aplicação');
+  }
+});
+
+app.delete('/api/inventory/applications/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de aplicação inválido.' });
+    res.json(await deleteApplication(id));
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao remover aplicação');
+  }
+});
+
+app.post('/api/inventory/applications/:id/listeners', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const applicationId = inventoryId(req.params.id);
+    const serverIpId = inventoryId(req.body?.serverIpId);
+    const protocol = String(req.body?.protocol || '').toUpperCase();
+    const port = Number(req.body?.port);
+    if (!applicationId || !serverIpId || !['TCP', 'UDP'].includes(protocol) || !Number.isInteger(port) || port < 1 || port > 65535) {
+      return res.status(400).json({ error: 'Listener inválido: selecione IP, protocolo TCP/UDP e porta 1–65535.' });
+    }
+    res.status(201).json({ listener: await addApplicationListener(applicationId, { serverIpId, protocol, port }) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao adicionar listener');
+  }
+});
+
+app.delete('/api/inventory/listeners/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de listener inválido.' });
+    res.json(await deleteApplicationListener(id));
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao remover listener');
+  }
+});
+
+app.post('/api/inventory/applications/:id/expected-clients', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const applicationId = inventoryId(req.params.id);
+    const ip = String(req.body?.ip || '').trim();
+    if (!applicationId) return res.status(400).json({ error: 'ID de aplicação inválido.' });
+    if (!net.isIP(ip)) return res.status(400).json({ error: 'IP cliente inválido.' });
+    res.status(201).json({ client: await addExpectedApplicationClient(applicationId, ip) });
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao adicionar cliente esperado');
+  }
+});
+
+app.delete('/api/inventory/expected-clients/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = inventoryId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de cliente esperado inválido.' });
+    res.json(await deleteExpectedApplicationClient(id));
+  } catch (e) {
+    return inventoryError(res, e, 'Falha ao remover cliente esperado');
+  }
+});
+
+// ---- sub-redes monitoradas ------------------------------------------
+// Único resíduo da feature de vigilância: cadastrar CIDRs para o mapa
+// filtrar e abrir junto com o sistema. Nada de host, achado ou peer.
+function validCidr(cidr) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(cidr || '');
+  if (!m) return false;
+  if (+m[5] > 32) return false;
+  return m.slice(1, 5).every((o) => +o <= 255);
+}
+
+app.get('/api/subnets', async (_req, res) => {
+  try {
+    res.json({ subnets: await listSubnets() });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha ao listar sub-redes', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/subnets', async (req, res) => {
+  try {
+    const cidr = (req.body?.cidr || '').trim();
+    const name = (req.body?.name || '').trim() || null;
+    if (!validCidr(cidr)) return res.status(400).json({ error: 'CIDR inválido (ex. 10.190.164.0/26)' });
+    res.json({ subnet: await addSubnet(cidr, name) });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao adicionar sub-rede', detail: String(e.message || e) });
+  }
+});
+
+app.patch('/api/subnets/:cidr', async (req, res) => {
+  try {
+    const cidr = decodeURIComponent(req.params.cidr);
+    const body = {};
+    if (req.body?.name !== undefined) body.name = (req.body.name || '').trim() || null;
+    if (req.body?.is_default !== undefined) body.is_default = !!req.body.is_default;
+    res.json({ subnet: await patchSubnet(cidr, body) });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao atualizar sub-rede', detail: String(e.message || e) });
+  }
+});
+
+app.delete('/api/subnets/:cidr', async (req, res) => {
+  try {
+    res.json(await delSubnet(decodeURIComponent(req.params.cidr)));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao remover sub-rede', detail: String(e.message || e) });
+  }
+});
+
+// Top 10 pares que mais conversam entre si (bidirecional somado).
+// ?subnet=CIDR filtra ANTES do ranking (top da sub-rede, não do global).
+// Ex: /api/top-pairs?minutes=60&subnet=172.20.20.0/24
+app.get('/api/top-pairs', async (req, res) => {
+  try {
+    const subnet = (req.query.subnet || '').trim() || null;
+    if (subnet && !/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(subnet)) {
+      return res.status(400).json({ error: 'Sub-rede inválida', detail: `Use IPv4/CIDR, ex.: 10.0.0.0/8 — recebido "${subnet}"` });
+    }
+    // `limit` era aceito e ignorado (o slice tinha 10 fixo): limit=-1 devolvia
+    // 200 com os 10 maiores, sem reclamar.
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 10, min: 1, max: 500 });
+    const t0 = Date.now();
+    const { topo, candidatos, truncadoES } = await fetchTopPairs(req.query, { limit, subnet });
+    const pares = topo.map((g) => {
+      // Quem mandou mais bytes. A tela mostra isso para não sugerir que o par
+      // conversou igual nos dois sentidos.
+      const altoFalouMais = g.bytesAlto > g.bytesBaixo;
+      return {
+        a: g.a, b: g.b,
+bytes: Math.round(g.bytes),
+        // `packetDeltaCount` não existe nesta ingestão: a soma volta null.
+        pacotes: Math.round(g.pacotes || 0),
+        flows: g.fluxos,
+        ladoPrincipal: altoFalouMais ? 'B>A' : 'A>B',
+        bytesLadoPrincipal: Math.round(altoFalouMais ? g.bytesAlto : g.bytesBaixo),
+        bytesLadoSecundario: Math.round(altoFalouMais ? g.bytesBaixo : g.bytesAlto),
+        inicio: g.inicio, fim: g.fim,
+        ...conversationDirection(g),
+        protocols: [...g.protocolos].map(protocolName),
+        topPorts: [...g.portas.values()].sort((x, y) => y.bytes - x.bytes).slice(0, 5)
+          .map((p) => ({ port: p.port, bytes: Math.round(p.bytes) }))
+      };
+    });
+    res.json({
+      pairs: pares,
+      subnet,
+      limit,
+      candidatos,
+      // A agregação de src+dst tem teto (`lados`). Se estoura, pode faltar par
+      // grande — a tela avisa em vez de apresentar ranking parcial como total.
+      truncadoES,
+      ms: Date.now() - t0
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha nos top pares', detail: String(e.message || e) });
+  }
+});
+
+// Busca histórica de QUALQUER IP (mesmo fora do mapa/janela): primeira vez,
+// última vez, peers, portas e atividade por dia. Ex: /api/lookup?ip=42.251.129.234&days=7
+app.get('/api/lookup', async (req, res) => {
+  try {
+    const ip = (req.query.ip || '').trim();
+    if (!ip) return res.status(400).json({ error: 'Envie ?ip=IP' });
+    const days = intParam(req.query.days, { nome: 'days', def: 7, min: 1, max: 90 });
+    const base = [
+      { range: { '@timestamp': { gte: `now-${days}d` } } },
+      { bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 } }
+    ];
+    const peerAggs = (field) => ({ terms: { field, size: 20 },
+      aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } });
+    const r = await client.search({ index: ELASTIC_INDEX, size: 0,
+      query: { bool: { filter: base } },
+      aggs: {
+        first: { min: { field: '@timestamp' } },
+        last: { max: { field: '@timestamp' } },
+        bytes: { sum: { field: 'netflow.octetDeltaCount' } },
+        as_src: { filter: { term: { [F_SRC]: ip } }, aggs: { peers: peerAggs(F_DST) } },
+        as_dst: { filter: { term: { [F_DST]: ip } }, aggs: { peers: peerAggs(F_SRC) } },
+        dports: { terms: { field: F_DPORT, size: 15 },
+          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } },
+        per_day: { date_histogram: { field: '@timestamp', calendar_interval: '1d', min_doc_count: 0,
+          extended_bounds: { min: `now-${days}d`, max: 'now-0d' } },
+          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } }
+      } });
+    const a = r.aggregations;
+    const peers = new Map();
+    for (const b of [...(a.as_src?.peers?.buckets || []), ...(a.as_dst?.peers?.buckets || [])]) {
+      const cur = peers.get(b.key) || { ip: b.key, bytes: 0, flows: 0 };
+      cur.bytes += b.bytes?.value || 0; cur.flows += b.doc_count;
+      peers.set(b.key, cur);
+    }
+    res.json({
+      ip, days,
+      found: (r.hits?.total?.value || 0) > 0,
+      firstSeen: a.first?.value_as_string || null,
+      lastSeen: a.last?.value_as_string || null,
+      flows: r.hits?.total?.value || 0,
+      bytes: Math.round(a.bytes?.value || 0),
+      peers: [...peers.values()].map((p) => ({ ...p, bytes: Math.round(p.bytes) }))
+        .sort((x, y) => y.bytes - x.bytes).slice(0, 20),
+      ports: (a.dports?.buckets || []).map((b) => ({ port: b.key, bytes: Math.round(b.bytes?.value || 0), flows: b.doc_count })),
+      daily: (a.per_day?.buckets || []).map((b) => ({
+        day: (b.key_as_string || '').slice(0, 10),
+        flows: b.doc_count, bytes: Math.round(b.bytes?.value || 0)
+      }))
+    });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha na busca', detail: String(e.message || e) });
+  }
+});
+
+// Base de reputação do Postgres: IPs já verificados + histórico de conexões,
+// agrupados por região. ?days=0 (tudo) &order=rep|reports|bytes|seen|country
+app.get('/api/reputation/db', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    res.json(await listReputationDb({ days: req.query.days, order: req.query.order, limit: req.query.limit }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha na base de reputação', detail: String(e.message || e) });
+  }
+});
+
+// Painel consolidado da tela "Reputação": KPIs, faixas de score, contexto de
+// uso, top país/ISP e série por dia. Leitura pura do Postgres (+ ES só quando a
+// janela é de 24h, para incluir o dia corrente) — não gasta cota do AbuseIPDB.
+// ?days=0 (base inteira)
+app.get('/api/reputation/overview', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const { overviewFor } = require('./reputation.js');
+    res.json(await overviewFor({ days: req.query.days }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha no painel de reputação', detail: String(e.message || e) });
+  }
+});
+
+// Colheita manual do histórico (mesma do job diário das 06:15). Ex: POST {hours: 168}
+// A tela de Regiões foi removida — quem consome esses dados é /api/reputation/db,
+// mas a coleta continua: é ela que alimenta ip_sightings e a reputação de TODOS
+// os IPs públicos (risco, destinos novos, país no dossiê).
+app.post('/api/stats/harvest', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const { harvest } = require('./regions.js');
+    const hours = intParam(req.body?.hours, { nome: 'hours', def: 24, min: 1, max: 24 * 30 });
+    res.json(await harvest(hours));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: 'Falha na colheita', detail: String(e.message || e) });
+  }
+});
+
+app.listen(PORT, () => console.log(`Backend rodando em http://localhost:${PORT} (indice ${ELASTIC_INDEX})`));
+
+if (FORTIGATE_HISTORY_CRON !== '0') {
+  setTimeout(async () => {
+    try {
+      const result = await collectFortigateSnapshots();
+      if (result.firewalls) console.log(`[fortigate] snapshot inicial: ${result.policies} políticas em ${result.firewalls} firewall(s)`);
+    } catch (e) {
+      console.error(`[fortigate] falha no snapshot inicial: ${e.message}`);
+    }
+  }, 8000);
+}
+
+// Recuperação da série diária usada no gráfico da tela de Reputação. O job das
+// 06:40 só roda se o processo estiver no ar naquele minuto; na subida, regravamos
+// os dias fechados que faltam. harvestDaily() apaga e regrava o dia idempotentemente.
+//
+// Fica DEPOIS do app.listen de propósito: a primeira requisição do usuário não
+// espera a releitura pesada do Elasticsearch.
+if ((process.env.DAILY_CRON || '40 6 * * *') !== '0' && process.env.DAILY_BACKFILL !== '0') {
+  setTimeout(async () => {
+    try {
+      if (!(await dbInit())) return;
+      const { harvestDaily, missingDays } = require('./daily.js');
+      const faltando = await missingDays({ max: 7 });
+      if (!faltando.length) return;
+      console.log(`[daily] ${faltando.length} dia(s) sem serie: ${faltando.join(', ')} - recuperando`);
+      const r = await harvestDaily(faltando);
+      console.log(`[daily] recuperacao concluida: ${r.upserted} pares em ${r.days} dias`);
+    } catch (e) {
+      console.error(`[daily] falha na recuperacao da serie: ${e.message}`);
+    }
+  }, 5000);
+}
