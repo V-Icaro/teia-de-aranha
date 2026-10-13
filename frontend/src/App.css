@@ -961,8 +961,6 @@ html { scrollbar-color: #c2c9cb #f1f2f3; }
 .fortigate-body .inventory-machine-summary { min-width: 0; }
 .fortigate-body .inventory-machine-summary input { width: 100%; margin: 2px 0; padding: 6px 8px; font-size: 11px; }
 .fortigate-policies { overflow: hidden; }
-.fortigate-history-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 9px; margin: 10px 0; }
-.fortigate-history-controls input[type="date"] { height: 31px; padding: 5px 8px; }
 .fortigate-policies .seg select { height: 26px; padding: 0 7px; border: 1px solid #d9ddde; border-radius: 3px; outline: none; background: #fff; color: #3d474b; cursor: pointer; font: 600 11px/1 var(--font); }
 .fortigate-policies .seg select:focus { border-color: #20b875; }
 .fortigate-policies .dashboard-data-table { min-width: 980px; }
@@ -1033,4 +1031,151 @@ html { scrollbar-color: #c2c9cb #f1f2f3; }
 @media (max-width: 760px) {
   .fgt-an-badges { width: 100%; justify-content: flex-start; }
   .fgt-an-toolbar { align-items: stretch; }
+}
+
+/* FortiGate: navegação e cartões de equipamento */
+.page-fortigate {
+  gap: 18px;
+  padding-top: 24px;
+  background: linear-gradient(180deg, #f8faf9 0, #f1f2f3 220px);
+}
+.fortigate-page-head {
+  padding-bottom: 16px;
+  border-bottom: 1px solid #dfe4e2;
+}
+.fortigate-page-head .page-title { gap: 12px; }
+.fortigate-page-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid #b8d9c6;
+  border-radius: 9px;
+  background: linear-gradient(145deg, #edf8f1, #d9f0e2);
+  color: #178a56;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -.4px;
+}
+.fortigate-page-head .page-title h2 { font-size: 22px; }
+.fortigate-count {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid #dce5df;
+  border-radius: 6px;
+  background: #fff;
+  color: #748079;
+  font-size: 11px;
+}
+.fortigate-count b { color: #2d6949; font-size: 16px; }
+.fortigate-body { width: 100%; max-width: 1700px; gap: 15px; margin: 0 auto; }
+.fortigate-add-panel {
+  grid-template-columns: minmax(220px,.8fr) minmax(0,2.2fr) !important;
+  gap: 22px;
+  padding: 18px 20px;
+  border-color: #d7e4dc;
+  box-shadow: 0 3px 12px rgba(36, 76, 52, .04);
+}
+.fortigate-add-heading { display: grid; align-content: center; gap: 4px; }
+.fortigate-add-heading h3 { margin: 0; color: #263a30; font-size: 15px; }
+.fortigate-step { color: #25885b; font-size: 9px; font-weight: 750; letter-spacing: 1px; }
+.fortigate-field { display: grid; min-width: 0; gap: 4px; color: #596761; font-size: 10px; font-weight: 650; }
+.fortigate-field input { width: 100%; }
+.fortigate-submit { min-height: 36px; align-self: end; }
+.fortigate-workspace { grid-template-columns: minmax(290px,.72fr) minmax(0,2fr) !important; gap: 15px; align-items: start; }
+.fortigate-list-panel,
+.fortigate-policies {
+  padding: 15px;
+  border-color: #dce3df;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(30, 50, 38, .035);
+}
+.fortigate-list-panel { position: sticky; top: 0; }
+.fortigate-list-panel .inventory-panel-head { align-items: flex-start; }
+.fortigate-list-panel .inventory-panel-head h3,
+.fortigate-policies .dashboard-section-head h3 { color: #293a31; font-size: 14px; }
+.fortigate-list { max-height: none; gap: 9px; overflow: visible; }
+.fortigate-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #e1e7e3;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  transition: border-color .15s, background .15s, box-shadow .15s;
+}
+.fortigate-card:hover { border-color: #b8d9c6; background: #fbfefc; }
+.fortigate-card.active {
+  border-color: #8fc8a6;
+  background: #f4faf6;
+  box-shadow: inset 3px 0 #20b875, 0 2px 8px rgba(28, 120, 75, .06);
+}
+.fortigate-card-head { display: grid; min-width: 0; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 9px; }
+.fortigate-device-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid #d7e5dc;
+  border-radius: 5px;
+  background: #f2f8f4;
+  color: #238554;
+  font-size: 17px;
+}
+.fortigate-device-info { display: grid; min-width: 0; gap: 2px; }
+.fortigate-device-info b { overflow: hidden; color: #2d3c33; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.fortigate-device-info .mono { overflow: hidden; color: #748079; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.fortigate-vdom { padding: 2px 7px; border: 1px solid #e0e6e3; border-radius: 999px; background: #f8faf9; color: #6c7871; font-size: 9px; }
+.fortigate-card-meta { display: flex; justify-content: space-between; gap: 8px; color: #89938e; font-size: 9px; }
+.fortigate-card-meta > span:first-child { display: inline-flex; align-items: center; gap: 5px; }
+.fortigate-token-dot { width: 6px; height: 6px; border-radius: 50%; background: #d1a441; }
+.fortigate-token-dot.on { background: #20a56a; box-shadow: 0 0 0 2px #20a56a1c; }
+.fortigate-card-actions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 5px; }
+.fortigate-card-actions button { min-width: 0; padding: 6px 5px; font-size: 10px; }
+.fortigate-card-actions .fortigate-analyze-button { grid-column: 1 / -1; min-height: 32px; border-color: #178c57; background: #1ca96a; color: #fff; font-size: 10.5px; }
+.fortigate-card-actions .fortigate-analyze-button:hover:not(:disabled) { border-color: #127848; background: #168f59; }
+.fortigate-card-actions .fortigate-remove-button { color: #a44348; }
+.fortigate-policies { min-width: 0; }
+.fortigate-policies .dashboard-section-head { align-items: flex-end; padding-bottom: 11px; border-bottom: 1px solid #edf0ee; }
+.fortigate-policies .dashboard-data-table th,
+.fortigate-policies .dashboard-data-table td { padding: 9px 8px; }
+.fortigate-policies .dashboard-data-table td small { color: #89938e; }
+.fortigate-policies .pager { margin-top: 10px; }
+.fgt-analysis .modal-head { align-items: center; }
+.fgt-analysis .modal-head h2 { font-size: 17px; }
+.fgt-an-list .inventory-machine-row {
+  grid-template-columns: 4px minmax(0,1fr) auto;
+  align-items: start;
+  gap: 11px;
+  padding: 12px;
+  border: 1px solid #e3e8e5;
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+}
+.fgt-an-list .inventory-machine-row:hover { border-color: #c8d9ce; background: #fcfefc; }
+.fgt-an-title { display: grid; gap: 4px; min-width: 0; }
+.fgt-an-title > p { margin: 0; }
+.fgt-an-block { margin-top: 7px; padding-top: 8px; border-top: 1px solid #edf0ee; }
+.fgt-an-block .fgt-an-badges { margin: 4px 0; }
+.fgt-an-block > button { justify-self: start; margin-top: 5px; }
+@media (max-width: 920px) {
+  .fortigate-workspace { grid-template-columns: 1fr !important; }
+  .fortigate-list-panel { position: static; }
+  .fortigate-list { grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); }
+  .fortigate-add-panel { grid-template-columns: 1fr !important; gap: 12px; }
+}
+@media (max-width: 640px) {
+  .fortigate-page-head { align-items: flex-start; }
+  .fortigate-count { display: none; }
+  .fortigate-list { grid-template-columns: 1fr; }
+  .fortigate-card-actions { grid-template-columns: 1fr 1fr; }
+  .fortigate-card-actions .fortigate-analyze-button { grid-column: 1 / -1; }
+  .fgt-an-list .inventory-machine-row { grid-template-columns: 4px minmax(0,1fr); }
+  .fgt-an-list .fgt-an-badges { grid-column: 2; margin-left: 0; }
 }

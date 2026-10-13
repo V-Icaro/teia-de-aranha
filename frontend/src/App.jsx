@@ -1,6 +1,8 @@
 ﻿import { useEffect, useRef, useState } from 'react';
 import cytoscape from 'cytoscape';
-import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRepOverview, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchDashboardPorts, fetchDashboardConversations, fetchDashboardBandwidth, fetchCriticalAccess, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, captureFortigateSnapshot, fetchFortigateHistory, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
+import DashboardScreen from './screens/Dashboard.jsx';
+import InventoryScreen from './screens/Inventory.jsx';
+import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRepOverview, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchDashboardPorts, fetchDashboardConversations, fetchDashboardBandwidth, fetchCriticalAccess, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
 
 const PRESETS = [
   { label: 'Últimos 5 min', minutes: 5 },
@@ -192,16 +194,10 @@ function FortigatePage() {
   const [policyError, setPolicyError] = useState('');
   const [sort, setSort] = useState('hits');
   const [offset, setOffset] = useState(0);
-  const [historyPeriod, setHistoryPeriod] = useState('30');
-  const [historySort, setHistorySort] = useState('bytes');
-  const [historyOffset, setHistoryOffset] = useState(0);
-  const [historyFrom, setHistoryFrom] = useState('');
-  const [historyTo, setHistoryTo] = useState('');
-  const [historyData, setHistoryData] = useState(null);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState('');
   const [detail, setDetail] = useState(null);
   const [analysis, setAnalysis] = useState(null);
+  const [analysisTarget, setAnalysisTarget] = useState(null);
+  const analysisRequestRef = useRef(0);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState('');
   const [staleDays, setStaleDays] = useState(90);
@@ -241,21 +237,6 @@ function FortigatePage() {
       .finally(() => { if (!cancelled) setPolicyLoading(false); });
     return () => { cancelled = true; };
   }, [selectedId, sort, offset, firewalls]);
-
-  useEffect(() => {
-    if (!selectedId || historyPeriod === 'custom') {
-      setHistoryData(null);
-      return undefined;
-    }
-    let cancelled = false;
-    setHistoryLoading(true);
-    setHistoryError('');
-    fetchFortigateHistory(selectedId, { days: Number(historyPeriod), sort: historySort, limit: 100, offset: historyOffset })
-      .then((data) => { if (!cancelled) setHistoryData(data); })
-      .catch((e) => { if (!cancelled) { setHistoryData(null); setHistoryError(String(e.message || e)); } })
-      .finally(() => { if (!cancelled) setHistoryLoading(false); });
-    return () => { cancelled = true; };
-  }, [selectedId, historyPeriod, historySort, historyOffset]);
 
   function resetForm() {
     setEditingId(null);
@@ -299,50 +280,15 @@ function FortigatePage() {
     }
   }
 
-  async function queryCustomHistory() {
-    if (!selectedId || !historyFrom || !historyTo) {
-      setHistoryError('Selecione as duas datas para consultar o período.');
-      return;
-    }
-    if (historyFrom > historyTo) {
-      setHistoryError('A data inicial não pode ser posterior à data final.');
-      return;
-    }
-    setHistoryLoading(true);
-    setHistoryError('');
-    try {
-      setHistoryOffset(0);
-      setHistoryData(await fetchFortigateHistory(selectedId, { from: historyFrom, to: historyTo, sort: historySort, limit: 100, offset: 0 }));
-    } catch (e) {
-      setHistoryData(null);
-      setHistoryError(String(e.message || e));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }
-
-  async function snapshotNow() {
-    if (!selectedId) return;
-    setBusy('snapshot');
-    setMessage('');
-    setHistoryError('');
-    try {
-      const result = await captureFortigateSnapshot(selectedId);
-      setMessage(`Snapshot salvo: ${result.policies} políticas em ${new Date(result.capturedAt).toLocaleString('pt-BR')}.`);
-      if (historyPeriod === 'custom') await queryCustomHistory();
-      else setHistoryData(await fetchFortigateHistory(selectedId, { days: Number(historyPeriod), sort: historySort, limit: 100, offset: historyOffset }));
-    } catch (e) {
-      setHistoryError(String(e.message || e));
-    } finally {
-      setBusy('');
-    }
-  }
-
   async function removeFirewall(firewall) {
     if (!confirm(`Remover ${firewall.name} (${firewall.host}) do inventário?`)) return;
     setBusy(`delete-${firewall.id}`);
     try {
       await deleteFortigate(firewall.id);
+      if (analysisTarget?.id === firewall.id) {
+        setAnalysis(null);
+        setAnalysisTarget(null);
+      }
       resetForm();
       await loadFirewalls(null);
     } catch (e) {
@@ -352,29 +298,44 @@ function FortigatePage() {
     }
   }
 
-  async function showPolicy(policyId) {
+  async function showPolicy(policyId, firewallId = selectedId, vdom = selected?.vdom || 'root') {
     setDetail({ loading: true, policyId });
     try {
-      const result = await fetchFortigatePolicyDetail(selectedId, policyId, selected?.vdom || 'root');
+      const result = await fetchFortigatePolicyDetail(firewallId, policyId, vdom);
       setDetail({ policyId, policy: result.policy, revision: result.revision });
     } catch (e) {
       setDetail({ policyId, error: String(e.message || e) });
     }
   }
 
-  async function runAnalysis() {
-    if (!selected) return;
+  async function runAnalysis(firewall) {
+    if (!firewall) return;
+    const requestId = analysisRequestRef.current + 1;
+    analysisRequestRef.current = requestId;
+    setSelectedId(firewall.id);
+    setAnalysisTarget({ id: firewall.id, name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root' });
     setAnalysis({ loading: true });
     setAnalysisError('');
     setAnalysisLoading(true);
     try {
-      setAnalysis(await fetchFortigateAnalysis(selected.id, { staleDays, vdom: selected.vdom || 'root' }));
+      const result = await fetchFortigateAnalysis(firewall.id, { staleDays, vdom: firewall.vdom || 'root' });
+      if (analysisRequestRef.current === requestId) setAnalysis(result);
     } catch (e) {
-      setAnalysis(null);
-      setAnalysisError(String(e.message || e));
+      if (analysisRequestRef.current === requestId) {
+        setAnalysis(null);
+        setAnalysisError(String(e.message || e));
+      }
     } finally {
-      setAnalysisLoading(false);
+      if (analysisRequestRef.current === requestId) setAnalysisLoading(false);
     }
+  }
+
+  function closeAnalysis() {
+    analysisRequestRef.current += 1;
+    setAnalysis(null);
+    setAnalysisTarget(null);
+    setAnalysisError('');
+    setAnalysisLoading(false);
   }
 
   const dateValue = (value) => {
@@ -390,45 +351,53 @@ function FortigatePage() {
 
   return (
     <main className="page-fortigate">
-      <div className="page-head">
+      <div className="page-head fortigate-page-head">
         <div className="page-title">
-          <div><h2>FortiGate</h2><span className="hint">políticas, estatísticas e análise consultiva</span></div>
+          <span className="fortigate-page-icon" aria-hidden="true">FG</span>
+          <div><h2>FortiGate</h2><span className="hint">Gestão de firewalls e análise consultiva de políticas</span></div>
         </div>
         <div className="page-actions">
-          <span className="badge low">{firewalls.length} firewalls</span>
-          <button className="ghost" onClick={() => loadFirewalls()} disabled={loading}>↻ Atualizar</button>
+          <span className="fortigate-count"><b>{firewalls.length}</b><span>firewalls cadastrados</span></span>
+          <button className="ghost" onClick={() => loadFirewalls()} disabled={loading} aria-label="Atualizar lista">↻ Atualizar</button>
         </div>
       </div>
       <div className="page-body fortigate-body">
         {error && <p className="error">{error}</p>}
         {message && <p className="hint">{message}</p>}
-        <section className="inventory-add-panel">
+        <section className="inventory-add-panel fortigate-add-panel">
           <div className="inventory-add-heading">
-            <h3>{editingId ? 'Editar FortiGate' : 'Cadastrar FortiGate'}</h3>
-            <p className="hint">O token é cifrado no servidor e nunca exibido novamente.</p>
+            <span className="fortigate-step">{editingId ? 'CONFIGURAÇÃO' : 'NOVO EQUIPAMENTO'}</span>
+            <h3>{editingId ? `Editar ${form.name || 'FortiGate'}` : 'Adicionar firewall'}</h3>
+            <p className="hint">Credenciais protegidas com AES-256-GCM. O token não é mostrado após salvar.</p>
           </div>
           <form className="cmp-form inventory-create-form" onSubmit={saveFirewall}>
-            <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Nome" required />
-            <input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="Host ou IP" required />
-            <input type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Token novo (opcional)' : 'Token API'} required={!editingId} autoComplete="new-password" />
-            <button type="submit" disabled={busy === 'save'}>{busy === 'save' ? 'Salvando…' : editingId ? 'Salvar' : 'Adicionar'}</button>
+            <label className="fortigate-field"><span>Nome de identificação</span><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex.: FGT-Matriz" required /></label>
+            <label className="fortigate-field"><span>Endereço do equipamento</span><input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="IP ou hostname" required /></label>
+            <label className="fortigate-field"><span>{editingId ? 'Substituir token (opcional)' : 'Token de API'}</span><input type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Deixe vazio para manter o atual' : 'Token API'} required={!editingId} autoComplete="new-password" /></label>
+            <button className="fortigate-submit" type="submit" disabled={busy === 'save'}>{busy === 'save' ? 'Salvando…' : editingId ? 'Salvar alterações' : 'Cadastrar'}</button>
             {editingId && <button type="button" className="ghost" onClick={resetForm}>Cancelar</button>}
           </form>
         </section>
         {loading && <p className="hint">Carregando firewalls…</p>}
         {!loading && !firewalls.length && <p className="empty">Nenhum FortiGate cadastrado.</p>}
         {!!firewalls.length && (
-          <div className="inventory-workspace">
-            <section className="inventory-machine-panel">
-              <div className="inventory-panel-head"><h3>Firewalls</h3><span className="badge low">{firewalls.length}</span></div>
-              <div className="inventory-machine-list">
+          <div className="inventory-workspace fortigate-workspace">
+            <section className="inventory-machine-panel fortigate-list-panel">
+              <div className="inventory-panel-head"><div><h3>Equipamentos</h3><span className="hint">Selecione um firewall para ver as políticas</span></div><span className="badge low">{firewalls.length}</span></div>
+              <div className="inventory-machine-list fortigate-list">
                 {firewalls.map((firewall) => (
-                  <article key={firewall.id} className={`inventory-machine-row${selectedId === firewall.id ? ' active' : ''}`} onClick={() => setSelectedId(firewall.id)}>
-                    <div className="inventory-machine-summary"><b>{firewall.name}</b><span className="hint">{firewall.host} · {firewall.hasToken ? 'token salvo' : 'sem token'}</span></div>
-                    <div className="inventory-machine-actions" onClick={(e) => e.stopPropagation()}>
+                  <article key={firewall.id} className={`fortigate-card${selectedId === firewall.id ? ' active' : ''}`} onClick={() => setSelectedId(firewall.id)}>
+                    <div className="fortigate-card-head">
+                      <span className="fortigate-device-icon" aria-hidden="true">▣</span>
+                      <div className="fortigate-device-info"><b>{firewall.name}</b><span className="mono">{firewall.host}</span></div>
+                      <span className="fortigate-vdom">{firewall.vdom || 'root'}</span>
+                    </div>
+                    <div className="fortigate-card-meta"><span><i className={`fortigate-token-dot${firewall.hasToken ? ' on' : ''}`} />{firewall.hasToken ? 'Token configurado' : 'Token ausente'}</span><span>ID {firewall.id}</span></div>
+                    <div className="fortigate-card-actions" onClick={(e) => e.stopPropagation()}>
+                      <button className="fortigate-analyze-button" onClick={() => runAnalysis(firewall)} disabled={analysisLoading}>{analysisLoading && analysisTarget?.id === firewall.id ? 'Analisando…' : 'Análise inteligente'}</button>
                       <button className="ghost" onClick={() => runTest(firewall)} disabled={busy === `test-${firewall.id}`}>{busy === `test-${firewall.id}` ? 'Testando…' : 'Testar'}</button>
                       <button className="ghost" onClick={() => { setEditingId(firewall.id); setForm({ name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root', token: '' }); }}>Editar</button>
-                      <button className="ghost" onClick={() => removeFirewall(firewall)} disabled={busy === `delete-${firewall.id}`}>Remover</button>
+                      <button className="ghost fortigate-remove-button" onClick={() => removeFirewall(firewall)} disabled={busy === `delete-${firewall.id}`}>Remover</button>
                     </div>
                   </article>
                 ))}
@@ -439,10 +408,9 @@ function FortigatePage() {
                 <div><h3>{selected?.name || 'Políticas'}</h3><span className="hint">{selected?.host || ''} · VDOM {selected?.vdom || 'root'}</span></div>
                 <div className="page-actions">
                   <label className="dashboard-period-select"><span>Ordenar</span><select value={sort} onChange={(e) => { setSort(e.target.value); setOffset(0); }}><option value="hits">Hits</option><option value="bytes">Bytes</option><option value="packets">Pacotes</option><option value="sessions">Sessões</option></select></label>
-                  <button className="ghost" onClick={runAnalysis} disabled={!selected || analysisLoading}>{analysisLoading ? 'Analisando…' : 'Análise inteligente'}</button>
                 </div>
               </div>
-              <p className="hint">A tabela acima mostra os contadores atuais do FortiGate, não um período selecionável. Use o resumo histórico abaixo para comparar datas.</p>
+              <p className="hint">Hits, bytes e pacotes são os contadores atuais retornados pelo FortiGate; primeira e última utilização são os timestamps informados pelo próprio equipamento.</p>
               {policyError && <p className="error">{policyError}</p>}
               {policyLoading ? <p className="hint">Consultando políticas no FortiGate…</p> : !selected ? <p className="hint">Selecione um firewall.</p> : !policiesData ? <p className="hint">Sem dados de política.</p> : (
                 <>
@@ -463,42 +431,6 @@ function FortigatePage() {
                     <button className="ghost" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - 20))}>Anterior</button>
                     <button className="ghost" disabled={offset + 20 >= (policiesData.total || 0)} onClick={() => setOffset(offset + 20)}>Próxima</button>
                   </div>
-                  <section className="fgt-sec">
-                    <div className="dashboard-section-head">
-                      <div><h4>Resumo histórico de uso</h4><span className="hint">calculado por diferenças entre snapshots dos contadores</span></div>
-                      <button className="ghost" onClick={snapshotNow} disabled={!selected || busy === 'snapshot'}>{busy === 'snapshot' ? 'Coletando…' : 'Coletar snapshot agora'}</button>
-                    </div>
-                    <div className="fortigate-history-controls">
-                      <label className="dashboard-period-select"><span>Período</span><select value={historyPeriod} onChange={(e) => { setHistoryPeriod(e.target.value); setHistoryOffset(0); }}><option value="7">7 dias</option><option value="30">30 dias</option><option value="90">90 dias</option><option value="custom">Datas personalizadas</option></select></label>
-                      <label className="dashboard-period-select"><span>Ordenar</span><select value={historySort} onChange={(e) => { setHistorySort(e.target.value); setHistoryOffset(0); }}><option value="bytes">Bytes</option><option value="hits">Hits</option><option value="packets">Pacotes</option><option value="position">Posição</option></select></label>
-                      {historyPeriod === 'custom' && <>
-                        <label className="dashboard-period-select"><span>De</span><input type="date" value={historyFrom} onChange={(e) => setHistoryFrom(e.target.value)} /></label>
-                        <label className="dashboard-period-select"><span>Até</span><input type="date" value={historyTo} onChange={(e) => setHistoryTo(e.target.value)} /></label>
-                        <button className="ghost" onClick={queryCustomHistory} disabled={historyLoading}>Consultar datas</button>
-                      </>}
-                    </div>
-                    <p className="hint">Bytes/hits do período são calculados por diferenças entre snapshots. A primeira amostra estabelece a base; para medir tráfego é preciso haver pelo menos duas amostras por política.</p>
-                    {historyError && <p className="error">{historyError}</p>}
-                    {!historyError && !historyData && <p className="hint">Consultando snapshots…</p>}
-                    {historyLoading && <p className="hint">Consultando histórico…</p>}
-                    {historyData && (
-                      <>
-                        <div className="fgt-an-summary">
-                          <span className="badge low">{historyData.total} políticas no histórico</span>
-                          <span className="badge low">{historyData.snapshots} snapshots no período</span>
-                          <span className={`badge ${historyData.coverageStartedBefore ? 'low' : 'med'}`}>{historyData.coverageStartedBefore ? 'Baseline anterior disponível' : 'Sem baseline anterior'}</span>
-                        </div>
-                        {!historyData.coverageStartedBefore && <p className="hint">Os snapshots começam em {historyData.coverageStart ? new Date(historyData.coverageStart).toLocaleString('pt-BR') : 'nenhuma coleta ainda'}. O FortiGate não fornece retroativamente esse período por este endpoint; o histórico vai se formando a partir das coletas.</p>}
-                        {historyData.policies.length ? <div className="table-wrap"><table className="dashboard-data-table">
-                          <thead><tr><th>Política</th><th>Posição</th><th>Hits no período</th><th>Bytes no período</th><th>Pacotes</th><th>Amostras</th><th>Resets</th></tr></thead>
-                          <tbody>{historyData.policies.map((policy) => <tr key={policy.policyid} className="fgt-policy-row" onClick={() => showPolicy(policy.policyid)}>
-                            <td><b>{policy.name || `Policy ${policy.policyid}`}</b><small>{policy.policyid}</small></td><td>{policy.position ?? '—'}</td><td>{policy.hits}</td><td>{fmtBytes(policy.bytes)}</td><td>{policy.packets}</td><td>{policy.samples}</td><td>{policy.counterResets || 0}</td>
-                          </tr>)}</tbody>
-                        </table></div> : <p className="hint">Ainda não há snapshots dentro desse período.</p>}
-                        {historyData.total > 100 && <div className="pager"><span>{historyData.total} políticas</span><button className="ghost" disabled={historyOffset <= 0 || historyLoading} onClick={() => setHistoryOffset(Math.max(0, historyOffset - 100))}>Anterior</button><button className="ghost" disabled={historyOffset + 100 >= historyData.total || historyLoading} onClick={() => setHistoryOffset(historyOffset + 100)}>Próxima</button></div>}
-                      </>
-                    )}
-                  </section>
                 </>
               )}
             </section>
@@ -527,11 +459,11 @@ function FortigatePage() {
         </div>
       )}
       {(analysis || analysisError) && (
-        <div className="modal-backdrop" onClick={() => { setAnalysis(null); setAnalysisError(''); }}>
+        <div className="modal-backdrop" onClick={closeAnalysis}>
           <div className="modal modal-wide fgt-analysis" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head"><div><h2>Análise inteligente · {selected?.name}</h2><span className="hint">Somente leitura; nenhuma mudança é aplicada.</span></div><button className="ghost" onClick={() => { setAnalysis(null); setAnalysisError(''); }}>✕</button></div>
+            <div className="modal-head"><div><h2>Análise inteligente · {analysisTarget?.name}</h2><span className="hint">{analysisTarget?.host} · VDOM {analysisTarget?.vdom} · análise somente leitura</span></div><button className="ghost" onClick={closeAnalysis}>✕</button></div>
             <div className="modal-body">
-              <div className="fgt-an-toolbar"><label className="field"><span>Inatividade para regra obsoleta</span><select value={staleDays} onChange={(e) => setStaleDays(Number(e.target.value))}><option value={30}>30 dias</option><option value={60}>60 dias</option><option value={90}>90 dias</option><option value={180}>180 dias</option></select></label><label className="field"><span>Severidade</span><select value={analysisSeverity} onChange={(e) => setAnalysisSeverity(e.target.value)}><option value="todas">Todas</option><option value="alta">Alta</option><option value="media">Média</option><option value="baixa">Baixa</option></select></label><button className="ghost" onClick={runAnalysis} disabled={analysisLoading}>Recalcular</button></div>
+              <div className="fgt-an-toolbar"><label className="field"><span>Inatividade para regra obsoleta</span><select value={staleDays} onChange={(e) => setStaleDays(Number(e.target.value))}><option value={30}>30 dias</option><option value={60}>60 dias</option><option value={90}>90 dias</option><option value={180}>180 dias</option></select></label><label className="field"><span>Severidade</span><select value={analysisSeverity} onChange={(e) => setAnalysisSeverity(e.target.value)}><option value="todas">Todas</option><option value="alta">Alta</option><option value="media">Média</option><option value="baixa">Baixa</option></select></label><button className="ghost" onClick={() => runAnalysis(analysisTarget)} disabled={analysisLoading}>Recalcular</button></div>
               {analysisError && <p className="error">{analysisError}</p>}
               {analysis?.loading && <p className="hint">Analisando configuração e uso…</p>}
               {analysis?.summary && <div className="fgt-an-summary"><span className="badge low">{analysis.summary.totalPolicies} políticas</span><span className="badge low">{analysis.summary.policiesWithStats} com estatística</span><span className="badge med">{analysis.summary.findings} achados</span></div>}
@@ -547,7 +479,7 @@ function FortigatePage() {
                       <div className="fgt-an-badges"><span className="badge low">Impacto: {finding.impact}</span><span className="badge med">Risco da mudança: {finding.changeRisk}</span></div>
                       {!!finding.evidence?.length && <><h5>Evidências</h5><ul>{finding.evidence.map((line, i) => <li key={i}>{line}</li>)}</ul></>}
                       {finding.validation && <div className="fgt-an-validate"><h5>Validar antes de mudar</h5><p>{finding.validation}</p></div>}
-                      <button className="ghost" onClick={(event) => { event.stopPropagation(); setAnalysis(null); showPolicy(finding.policyid); }}>Ver política</button>
+                      <button className="ghost" onClick={(event) => { event.stopPropagation(); closeAnalysis(); showPolicy(finding.policyid, analysisTarget?.id, analysisTarget?.vdom); }}>Ver política</button>
                     </div>}
                   </div>
                   <div className="fgt-an-badges"><span className={`badge ${findingClass(finding.severity)}`}>{severityLabel(finding.severity)}</span>{finding.confidence && <span className="badge low">Confiança: {finding.confidence}</span>}<span className="fgt-an-caret">{expanded ? '▾' : '▸'}</span></div>
@@ -1979,6 +1911,31 @@ cy.current.on('tap', (evt) => {
 
   const protos = [...new Set(graph.edges.map((e) => e.data.protocol))].sort();
   const selectedInventoryServer = inventoryData.find((server) => server.id === inventorySelectedId) || inventoryData[0] || null;
+  const dashboardScreenProps = {
+    dashboardTab, closeDashboard, topTalkersConfig, bandwidthPeriod, criticalAccessDays,
+    fmtWindow, useCustom, custom, minutes, loadInventory, setDashboardRefresh,
+    inventoryLoading, dashboardLoading, dashboardPortsLoading, dashboardConversationsLoading,
+    dashboardBandwidthLoading, criticalAccessLoading, setDashboardTab, inventoryData,
+    inventoryError, openInventory, dashboardServerId, setDashboardServerId,
+    dashboardData, dashboardError, fmtBytes, dashboardPortsData, dashboardPortsError,
+    bandwidthGroup, setBandwidthGroup, setBandwidthPeriod, watchSubnets,
+    dashboardBandwidthData, dashboardBandwidthError, fmtRate,
+    criticalAccessData, criticalAccessError, setCriticalAccessDays, conversationEndpoint,
+    topTalkersForm, setTopTalkersForm, setTopTalkersConfig,
+    dashboardConversationsData, dashboardConversationsError, fmtAccessTime
+  };
+  const inventoryScreenProps = {
+    closeInventory, inventoryData, loadInventory, inventoryLoading, inventoryError,
+    newServerName, setNewServerName, newServerIp, setNewServerIp, addInventoryServer,
+    inventoryBusy, inventoryEdit, setInventoryEdit, saveInventoryEdit,
+    inventorySelectedId, setInventorySelectedId, removeInventoryServer,
+    setApplicationDrafts, applicationDrafts, inventoryNewApplicationRef,
+    selectedInventoryServer, openIpModal, newServerIps, setNewServerIps,
+    addInventoryIp, removeInventoryIp, setApplicationDraft,
+    addInventoryApplication, removeInventoryApplication, expectedClientDrafts,
+    setExpectedClientDrafts, removeExpectedClient, addExpectedClient,
+    listenerDrafts, setListenerDraft, removeInventoryListener, addInventoryListener
+  };
 
   return (
     <div className={`layout${repDbOpen ? ' rep-page' : ''}${dashboardOpen ? ' dashboard-page' : ''}${inventoryOpen ? ' inventory-page' : ''}${fortigateOpen ? ' fortigate-page' : ''}`}>
@@ -2053,335 +2010,7 @@ cy.current.on('tap', (evt) => {
 
       {fortigateOpen && <FortigatePage />}
 
-      {dashboardOpen && (
-        <main className="page-dashboard">
-          <div className="page-head">
-            <div className="page-title">
-              <button className="ghost" onClick={closeDashboard} title="Voltar ao mapa">← mapa</button>
-              <div><h2>Dashboard</h2><span className="hint">visão de tráfego por máquina</span></div>
-            </div>
-            <div className="page-actions">
-              <span className="badge low">{dashboardTab === 'topTalkers' ? topTalkersConfig.time : dashboardTab === 'bandwidth' ? bandwidthPeriod : dashboardTab === 'criticalAccess' ? `${criticalAccessDays}d` : fmtWindow(useCustom, custom, minutes)}</span>
-              <button className="ghost" onClick={() => { loadInventory(); setDashboardRefresh((n) => n + 1); }} disabled={inventoryLoading || dashboardLoading || dashboardPortsLoading || dashboardConversationsLoading || dashboardBandwidthLoading || criticalAccessLoading} title="Atualizar inventário e dados">↻</button>
-            </div>
-          </div>
-          <div className="page-bar dashboard-page-bar">
-            <div className="seg dashboard-tabs">
-              <button className={dashboardTab === 'applications' ? 'active' : ''} onClick={() => setDashboardTab('applications')}>Aplicações</button>
-              <button className={dashboardTab === 'ports' ? 'active' : ''} onClick={() => setDashboardTab('ports')}>Portas</button>
-              <button className={dashboardTab === 'bandwidth' ? 'active' : ''} onClick={() => setDashboardTab('bandwidth')}>Banda</button>
-              <button className={dashboardTab === 'criticalAccess' ? 'active' : ''} onClick={() => setDashboardTab('criticalAccess')}>Acessos críticos</button>
-              <button className={dashboardTab === 'topTalkers' ? 'active' : ''} onClick={() => setDashboardTab('topTalkers')}>Tráfego</button>
-            </div>
-            <span className="hint">{dashboardTab === 'applications' ? 'Ranking por fluxos NetFlow · volume em bytes' : dashboardTab === 'ports' ? 'Ranking por fluxos em portas conhecidas de aplicações' : dashboardTab === 'bandwidth' ? 'Série temporal e capacidade da máquina' : dashboardTab === 'criticalAccess' ? 'Clientes de serviços críticos das máquinas do inventário' : 'Conversas que envolvem IPs do inventário'}</span>
-          </div>
-          <div className={`dashboard-grid${['topTalkers','criticalAccess'].includes(dashboardTab) ? ' dashboard-wide-grid' : ''}`}>
-            <aside className="dashboard-machines">
-              <div className="dashboard-section-head">
-                <h3>Máquinas</h3>
-                <span className="badge low">{inventoryData.length}</span>
-              </div>
-              {inventoryError && <p className="error">{inventoryError}</p>}
-              {inventoryLoading && <p className="hint">Carregando inventário…</p>}
-              {!inventoryLoading && !inventoryData.length && (
-                <div className="empty">Nenhuma máquina cadastrada.<br /><button className="ghost" onClick={openInventory} style={{ marginTop: 10 }}>Abrir inventário</button></div>
-              )}
-              <div className="dashboard-machine-list">
-                {inventoryData.map((server) => (
-                  <button key={server.id} className={`dashboard-machine${dashboardServerId === server.id ? ' active' : ''}`} onClick={() => setDashboardServerId(server.id)}>
-                    <span className="dashboard-machine-name">{server.name}</span>
-                    <span className="hint">{server.ips.map((x) => x.ip).join(' · ') || 'sem IP'}</span>
-                    <span className="dashboard-machine-meta">{server.applications.length} aplicações · {server.ips.length} IPs</span>
-                  </button>
-                ))}
-              </div>
-            </aside>
-
-            {dashboardTab === 'applications' ? (
-            <section className="dashboard-applications">
-              {!dashboardServerId ? (
-                <div className="empty">Selecione uma máquina cadastrada para ver suas aplicações.</div>
-              ) : dashboardLoading ? (
-                <p className="hint">Consultando NetFlow para esta máquina…</p>
-              ) : dashboardError ? (
-                <p className="error">Falha ao carregar o dashboard: {dashboardError}</p>
-              ) : !dashboardData ? (
-                <p className="hint">Aguardando consulta de aplicações…</p>
-              ) : (
-                <>
-                  <div className="dashboard-section-head">
-                    <div>
-                      <h3>{dashboardData.server.name}</h3>
-                      <span className="hint">{dashboardData.server.ips.map((x) => x.ip).join(' · ')}</span>
-                    </div>
-                    <span className="badge low">{dashboardData.applicationsWithTraffic} de {dashboardData.totalApplications} com tráfego</span>
-                  </div>
-                  <p className="hint">
-                    Top 5 por registros NetFlow que coincidem com IP, protocolo e porta do listener. Um fluxo NetFlow não representa necessariamente uma requisição de aplicação.
-                  </p>
-                  {!dashboardData.applications.length ? (
-                    <div className="empty">Esta máquina ainda não tem aplicações cadastradas.<br /><button className="ghost" onClick={openInventory} style={{ marginTop: 10 }}>Cadastrar aplicações</button></div>
-                  ) : dashboardData.applications[0].flows === 0 ? (
-                    <p className="hint">Nenhum fluxo corresponde aos listeners cadastrados nesta janela.</p>
-                  ) : null}
-                  <div className="table-wrap dashboard-table-wrap">
-                    <table className="dashboard-data-table" aria-label="Aplicações mais acessadas">
-                      <thead><tr><th>Aplicação</th><th>Tráfego</th><th>Utilização</th><th>Entrada / saída</th><th>Listeners</th></tr></thead>
-                      <tbody>
-                        {dashboardData.applications.map((application, index) => {
-                          const maxFlows = Math.max(1, ...dashboardData.applications.map((app) => app.flows));
-                          const utilization = Math.round((application.flows / maxFlows) * 100);
-                          return (
-                            <tr key={application.id}>
-                              <td><span className="dashboard-rank">{index + 1}</span><b className="dashboard-row-name">{application.name}</b></td>
-                              <td><b>{application.flows} fluxos</b><small>{fmtBytes(application.bytes)}</small></td>
-                              <td><div className="dashboard-utilization"><div className="bar"><i style={{ width: `${Math.max(application.flows ? 2 : 0, utilization)}%` }} /></div><span>{utilization}%</span></div></td>
-                              <td><span className="dashboard-direction">↓ {fmtBytes(application.incoming.bytes)} <i>·</i> ↑ {fmtBytes(application.outgoing.bytes)}</span></td>
-                              <td className="dashboard-listeners">{application.listeners.map((l) => `${l.protocol}/${l.port}`).join(' · ') || 'nenhum configurado'}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              )}
-            </section>
-            ) : dashboardTab === 'ports' ? (
-            <section className="dashboard-applications">
-              {!dashboardServerId ? (
-                <div className="empty">Selecione uma máquina cadastrada para ver suas portas.</div>
-              ) : dashboardPortsLoading ? (
-                <p className="hint">Consultando portas conhecidas no NetFlow…</p>
-              ) : dashboardPortsError ? (
-                <p className="error">Falha ao carregar as portas: {dashboardPortsError}</p>
-              ) : !dashboardPortsData ? (
-                <p className="hint">Aguardando consulta de portas…</p>
-              ) : (
-                <>
-                  <div className="dashboard-section-head">
-                    <div>
-                      <h3>{dashboardPortsData.server.name}</h3>
-                      <span className="hint">{dashboardPortsData.server.ips.map((x) => x.ip).join(' · ')}</span>
-                    </div>
-                    <span className="badge low">{dashboardPortsData.portsWithTraffic} portas com tráfego</span>
-                  </div>
-                  <p className="hint">
-                    Top 5 por registros NetFlow nas portas locais do servidor: destino na entrada e origem na saída. A porta do peer remoto é ignorada. Um fluxo NetFlow não representa necessariamente uma requisição de aplicação.
-                  </p>
-                  {!dashboardPortsData.ports.length ? (
-                    <div className="empty">Nenhuma porta conhecida com tráfego nesta janela.</div>
-                  ) : (
-                    <div className="table-wrap dashboard-table-wrap">
-                      <table className="dashboard-data-table dashboard-ports-table" aria-label="Portas de serviço mais acessadas">
-                        <thead><tr><th>Serviço / porta</th><th>Tráfego</th><th>Utilização</th><th>Entrada / saída</th><th>Protocolo</th></tr></thead>
-                        <tbody>
-                          {dashboardPortsData.ports.map((port, index) => {
-                            const maxFlows = Math.max(1, ...dashboardPortsData.ports.map((item) => item.flows));
-                            const utilization = Math.round((port.flows / maxFlows) * 100);
-                            return (
-                              <tr key={port.port}>
-                                <td><span className="dashboard-rank">{index + 1}</span><b className="dashboard-row-name">{port.service} · {port.port}</b></td>
-                                <td><b>{port.flows} fluxos</b><small>{fmtBytes(port.bytes)}</small></td>
-                                <td><div className="dashboard-utilization"><div className="bar"><i style={{ width: `${Math.max(2, utilization)}%` }} /></div><span>{utilization}%</span></div></td>
-                                <td><span className="dashboard-direction">↓ {fmtBytes(port.incoming.bytes)} <i>·</i> ↑ {fmtBytes(port.outgoing.bytes)}</span></td>
-                                <td>{port.protocols.join(' · ') || 'não identificados'}</td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </>
-              )}
-            </section>
-            ) : dashboardTab === 'bandwidth' ? (
-            <section className="dashboard-applications dashboard-bandwidth">
-              {!dashboardServerId ? (
-                <div className="empty">Selecione uma máquina cadastrada para ver sua banda.</div>
-              ) : dashboardBandwidthLoading ? (
-                <p className="hint">Agregando tráfego ao longo do tempo…</p>
-              ) : dashboardBandwidthError ? (
-                <p className="error">Falha ao carregar a série de banda: {dashboardBandwidthError}</p>
-              ) : !dashboardBandwidthData ? (
-                <p className="hint">Aguardando série de banda…</p>
-              ) : (
-                <>
-                  <div className="dashboard-section-head bandwidth-heading">
-                    <div>
-                      <h3>{dashboardBandwidthData.server.name}</h3>
-                      <span className="hint">{dashboardBandwidthData.server.ips.map((item) => item.ip).join(' · ')} · {dashboardBandwidthData.groupBy === 'application' ? 'por aplicação' : dashboardBandwidthData.groupBy === 'exporter' ? 'por exporter' : dashboardBandwidthData.groupBy === 'subnet' ? 'por sub-rede (IPs inventariados)' : 'por máquina'} · fonte {dashboardBandwidthData.source === 'pair_daily' ? 'pair_daily' : 'NetFlow em tempo real'}</span>
-                    </div>
-                    <div className="dashboard-bandwidth-controls">
-                      <label className="dashboard-period-select"><span>Agrupar por</span><select value={bandwidthGroup} onChange={(event) => setBandwidthGroup(event.target.value)}>
-                        <option value="server">Máquina</option>
-                        <option value="subnet" disabled={!watchSubnets?.length}>Sub-rede</option>
-                        <option value="application" disabled={!inventoryData.find((item) => item.id === dashboardServerId)?.applications.length || ['7d','30d'].includes(bandwidthPeriod)}>Aplicação</option>
-                        <option value="exporter" disabled={['7d','30d'].includes(bandwidthPeriod)}>Exporter</option>
-                      </select></label>
-                      <label className="dashboard-period-select"><span>Período</span><select value={bandwidthPeriod} onChange={(event) => {
-                        const period = event.target.value;
-                        setBandwidthPeriod(period);
-                        if (['7d','30d'].includes(period) && ['application','exporter'].includes(bandwidthGroup)) setBandwidthGroup('server');
-                      }}><option value="1h">1h</option><option value="6h">6h</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option></select></label>
-                    </div>
-                  </div>
-                  <div className="kpis dashboard-bandwidth-kpis">
-                    <div><b>{fmtBytes(dashboardBandwidthData.summary.totalBytes)}</b><span>volume total</span></div>
-                    <div><b>{fmtRate(dashboardBandwidthData.summary.averageBitsPerSecond)}</b><span>média</span></div>
-                    <div><b>{fmtRate(dashboardBandwidthData.summary.peakBitsPerSecond)}</b><span>pico</span></div>
-                    <div><b>{fmtRate(dashboardBandwidthData.summary.p95BitsPerSecond)}</b><span>percentil 95</span></div>
-                  </div>
-                  {!dashboardBandwidthData.series.length || dashboardBandwidthData.summary.totalFlows === 0 ? (
-                    <div className="empty">Sem fluxos para este agrupamento no período.</div>
-                  ) : (() => {
-                    const series = dashboardBandwidthData.series;
-                    const buckets = series[0]?.buckets || [];
-                    const maxRate = Math.max(1, ...series.flatMap((line) => line.buckets.map((bucket) => bucket.bitsPerSecond)));
-                    const labelStep = Math.max(1, Math.ceil(buckets.length / 8));
-                    const seriesColors = ['#21b875', '#3478c8', '#8b65ba', '#ec8b32', '#1a9e9b'];
-                    return (
-                      <>
-                        <div className="bandwidth-chart-wrap">
-                          <div className="bandwidth-y-axis"><span>{fmtRate(maxRate)}</span><span>{fmtRate(maxRate / 2)}</span><span>0</span></div>
-                          <div className="bandwidth-plot" role="img" aria-label={`Banda de ${dashboardBandwidthData.server.name} ao longo de ${bandwidthPeriod}`}>
-                          {buckets.map((bucket, index) => {
-                            const time = new Date(bucket.time);
-                            const label = bandwidthPeriod.endsWith('d')
-                              ? time.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })
-                              : time.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-                            return (
-                              <div className="bandwidth-time-group" key={bucket.time}>
-                                <div className="bandwidth-series-bars">
-                                  {series.map((line, lineIndex) => {
-                                    const point = line.buckets[index] || { bitsPerSecond: 0, bytes: 0 };
-                                    const height = Math.round((point.bitsPerSecond / maxRate) * 100);
-                                    return <i key={line.key} title={`${line.label} · ${fmtRate(point.bitsPerSecond)} · ${fmtBytes(point.bytes)}`} style={{ height: `${point.bitsPerSecond ? Math.max(2, height) : 0}%`, background: seriesColors[lineIndex % seriesColors.length] }} />;
-                                  })}
-                                </div>
-                                {index % labelStep === 0 && <small>{label}</small>}
-                              </div>
-                            );
-                          })}
-                          </div>
-                        </div>
-                        {series.length > 1 && <div className="bandwidth-legend">{series.map((line, index) => <span key={line.key}><i style={{ background: seriesColors[index % seriesColors.length] }} />{line.label}</span>)}</div>}
-                      </>
-                    );
-                  })()}
-                  <p className="hint">Banda estimada por bucket: bytes NetFlow × 8 ÷ duração do intervalo. P95 é calculado sobre os pontos da série. O vDS pode exportar o mesmo tráfego em mais de um ponto; valide interfaces e direção antes de usar os totais para cobrança.</p>
-                </>
-              )}
-            </section>
-            ) : dashboardTab === 'criticalAccess' ? (
-            <section className="dashboard-applications dashboard-critical-access">
-              <div className="dashboard-section-head">
-                <div><h3>Quem acessa serviços críticos</h3><span className="hint">TCP 22, 445, 1433, 3389 e 5985 · histórico diário mais fluxos recentes</span></div>
-                <label className="dashboard-period-select"><span>Período</span><select value={criticalAccessDays} onChange={(event) => setCriticalAccessDays(Number(event.target.value))}><option value={30}>30 dias</option><option value={90}>90 dias</option><option value={365}>365 dias</option></select></label>
-              </div>
-              {criticalAccessLoading ? (
-                <p className="hint">Consultando acessos às portas críticas…</p>
-              ) : criticalAccessError ? (
-                <p className="error">Falha ao carregar acessos críticos: {criticalAccessError}</p>
-              ) : !criticalAccessData ? (
-                <p className="hint">Aguardando consulta de acessos…</p>
-              ) : criticalAccessData.inventoryIps === 0 ? (
-                <div className="empty">Nenhum IP cadastrado no inventário.</div>
-              ) : !criticalAccessData.clients.length ? (
-                <div className="empty">Nenhum acesso a essas portas no período selecionado.</div>
-              ) : (
-                <>
-                  <div className="dashboard-summary">
-                    <span className="badge low">{criticalAccessData.clients.length} acessos · {criticalAccessData.days} dias</span>
-                    <span className="hint">“Novo” indica primeira aparição no período. “Fora do esperado” depende da allowlist cadastrada na aplicação; sem allowlist o estado fica sem baseline.</span>
-                  </div>
-                  {criticalAccessData.truncated && <p className="error">A consulta excedeu o limite de páginas; a lista pode estar incompleta.</p>}
-                  <div className="table-wrap dashboard-table-wrap">
-                    <table className="dashboard-data-table dashboard-critical-access-table" aria-label="Clientes que acessaram serviços críticos do inventário">
-                      <thead><tr><th>Serviço</th><th>Servidor</th><th>Cliente</th><th>Classificação</th><th>Primeiro acesso</th><th>Último acesso</th><th>Fluxos</th><th>Bytes</th></tr></thead>
-                      <tbody>{criticalAccessData.clients.map((access) => (
-                        <tr key={`${access.source}|${access.target}|${access.protocol}|${access.port}`}>
-                          <td><b>{access.service} · {access.port}</b><small>{access.applications.join(' · ') || access.protocol}</small></td>
-                          <td>{conversationEndpoint(access.target)}</td>
-                          <td>{conversationEndpoint(access.source)}</td>
-                          <td><div className="critical-access-status">
-                            {access.isNew && <span className="badge med">Novo</span>}
-                            {access.expectedStatus === 'expected' && <span className="badge low">Esperado</span>}
-                            {access.expectedStatus === 'unexpected' && <span className="badge high">Fora do esperado</span>}
-                            {access.expectedStatus === 'unconfigured' && <span className="badge med">Sem baseline</span>}
-                          </div></td>
-                          <td>{fmtAccessTime(access.firstSeen)}</td>
-                          <td>{fmtAccessTime(access.lastSeen)}</td>
-                          <td>{access.flows}</td>
-                          <td>{fmtBytes(access.bytes)}</td>
-                        </tr>
-                      ))}</tbody>
-                    </table>
-                  </div>
-                </>
-              )}
-            </section>
-            ) : (
-            <section className="dashboard-applications dashboard-conversations">
-              <form className="dashboard-conversation-form" onSubmit={(event) => {
-                event.preventDefault();
-                setTopTalkersConfig({ top: Number(topTalkersForm.top), time: topTalkersForm.time, flowType: topTalkersForm.flowType });
-                setDashboardRefresh((n) => n + 1);
-              }}>
-                <label><span>Top</span><select value={topTalkersForm.top} onChange={(event) => setTopTalkersForm((current) => ({ ...current, top: event.target.value }))}>{Array.from({ length: 20 }, (_, index) => <option key={index + 1} value={index + 1}>{index + 1}</option>)}</select></label>
-                <label><span>Time</span><select value={topTalkersForm.time} onChange={(event) => setTopTalkersForm((current) => ({ ...current, time: event.target.value }))}><option value="1h">1h</option><option value="6h">6h</option><option value="24h">24h</option></select></label>
-                <label><span>Flow type</span><select value={topTalkersForm.flowType} onChange={(event) => setTopTalkersForm((current) => ({ ...current, flowType: event.target.value }))}><option value="ingress">Ingress</option><option value="egress">Egress</option><option value="both">Both</option></select></label>
-                <button type="submit" disabled={dashboardConversationsLoading}>{dashboardConversationsLoading ? 'Consultando…' : 'Aplicar'}</button>
-              </form>
-              {dashboardConversationsLoading ? (
-                <p className="hint">Consultando conversas dos IPs inventariados…</p>
-              ) : dashboardConversationsError ? (
-                <p className="error">Falha ao carregar tráfego: {dashboardConversationsError}</p>
-              ) : !dashboardConversationsData ? (
-                <p className="hint">Aguardando consulta de conversas…</p>
-              ) : dashboardConversationsData.inventoryIps === 0 ? (
-                <div className="empty">Nenhum IP cadastrado no inventário.<br /><button className="ghost" onClick={openInventory} style={{ marginTop: 10 }}>Abrir inventário</button></div>
-              ) : !dashboardConversationsData.pairs.length ? (
-                <div className="empty">Nenhuma conversa encontrada para os IPs do inventário neste período.</div>
-              ) : (
-                <>
-                  <div className="dashboard-section-head">
-                    <h3>Top {dashboardConversationsData.top} conversas</h3>
-                    <span className="badge low">{dashboardConversationsData.inventoryIps} IPs · {dashboardConversationsData.time} · {dashboardConversationsData.flowType}</span>
-                  </div>
-                  <div className="table-wrap dashboard-table-wrap">
-                    <table className="dashboard-data-table dashboard-conversation-table" aria-label="Top conversas entre máquinas do inventário e seus peers">
-                      <thead><tr><th>Conversação</th><th>Total</th><th>Fluxos</th><th>Cliente → servidor</th><th>Servidor → cliente</th><th>Direção exportador</th><th>Protocolos</th><th>Portas</th></tr></thead>
-                      <tbody>
-                        {dashboardConversationsData.pairs.map((pair, index) => (
-                          <tr key={`${pair.a}|${pair.b}`}>
-                            <td>
-                              <span className="dashboard-rank">{index + 1}</span>
-                              <span className="conversation-peers">
-                                {pair.clientIp ? <>{conversationEndpoint(pair.clientIp)}<i>→</i>{conversationEndpoint(pair.serverIp)}</> : <>{conversationEndpoint(pair.a)}<i>↔</i>{conversationEndpoint(pair.b)}</>}
-                              </span>
-                              {!pair.clientIp && <small>{pair.directionConfidence === 'ambiguous' ? 'iniciador ambíguo' : 'sem SYN observado'}</small>}
-                            </td>
-                            <td><b>{fmtBytes(pair.bytes)}</b></td>
-                            <td><b>{pair.flows}</b><small>{pair.packets} pacotes</small></td>
-                            <td>{pair.clientToServerBytes == null ? '—' : fmtBytes(pair.clientToServerBytes)}</td>
-                            <td>{pair.serverToClientBytes == null ? '—' : fmtBytes(pair.serverToClientBytes)}</td>
-                            <td>{pair.flowDirections.map((direction) => `${direction.label} (${direction.flows})`).join(' · ') || '—'}</td>
-                            <td>{pair.protocols.join(' · ') || '—'}</td>
-                            <td>{pair.topPorts.map((port) => port.port).join(' · ') || '—'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              )}
-            </section>
-            )}
-          </div>
-        </main>
-      )}
+      {dashboardOpen && <DashboardScreen {...dashboardScreenProps} />}
 
       <aside className="sidebar">
         <section className="card">
@@ -2504,6 +2133,7 @@ cy.current.on('tap', (evt) => {
           <span className="sep">·</span>
           <span>{graph.nodes?.length || 0} hosts · {graph.edges?.length || 0} fluxos</span>
           {perfMode && <><span className="sep">·</span><span>modo desempenho</span></>}
+          {graph.meta?.truncated && <><span className="sep">·</span><span className="badge med" title="O limite de buckets foi atingido; reduza o período ou eleve MAX_EDGES.">resultado parcial</span></>}
         </div>
         {!selected && !edgeInfo && !subnetEmpty && <div className="canvas-tip">Clique num nó para detalhes · clique numa linha para ver portas · arraste para mover</div>}
         {subnetEmpty && (
@@ -2560,6 +2190,7 @@ cy.current.on('tap', (evt) => {
               <div><b>{fmtBytes(hostDetail.totalInBytes)}</b><span>entrada</span></div>
               <div><b>{hostDetail.totalOutPackets + hostDetail.totalInPackets}</b><span>pacotes</span></div>
             </div>
+            {hostDetail.truncated && <p className="error">A consulta atingiu o limite de buckets; a lista de conexões pode estar incompleta. Reduza o período para detalhar este host.</p>}
             <h3 style={{ margin: '2px 0 0', fontSize: 12, color: 'var(--mut)' }}>Conexões ({hostDetail.connections.length})</h3>
             <div className="table-wrap">
               <table>
@@ -2653,6 +2284,7 @@ cy.current.on('tap', (evt) => {
                   </div>
 
                   <h3>Tráfego na janela</h3>
+                  {ipModal.truncated && <p className="error">A consulta atingiu o limite de buckets; este dossiê pode estar incompleto. Reduza o período.</p>}
                   <div className="kpis">
                     <div><b>{fmtBytes(ipModal.traffic.outBytes)}</b><span>saída</span></div>
                     <div><b>{fmtBytes(ipModal.traffic.inBytes)}</b><span>entrada</span></div>
@@ -2707,6 +2339,7 @@ cy.current.on('tap', (evt) => {
               {cmpError && <p className="error">{cmpError}</p>}
               {cmpData && (
                 <>
+                  {cmpData.truncated && <p className="error">A consulta atingiu o limite de buckets; a comparação pode estar incompleta. Reduza o período.</p>}
                   <div className="kpis kpis-2">
                     <div><b>{cmpData.a}</b><span>→ {fmtBytes(cmpData.aToB.bytes)} · {cmpData.aToB.flows} fluxos</span></div>
                     <div><b>{cmpData.b}</b><span>→ {fmtBytes(cmpData.bToA.bytes)} · {cmpData.bToA.flows} fluxos</span></div>
@@ -2792,190 +2425,7 @@ cy.current.on('tap', (evt) => {
           </div>
         </div>
       )}
-      {inventoryOpen && (
-        <main className="page-inventory">
-          <div className="page-head inventory-page-head">
-            <div className="page-title">
-              <button className="ghost" onClick={closeInventory} title="Voltar para a tela anterior">← voltar</button>
-              <div><h2>Inventário</h2><span className="hint">máquinas, endereços IP, aplicações e listeners</span></div>
-            </div>
-            <div className="page-actions">
-              <span className="badge low">{inventoryData.length} máquinas</span>
-              <button className="ghost" onClick={loadInventory} disabled={inventoryLoading} title="Atualizar inventário">↻</button>
-            </div>
-          </div>
-          <div className="inventory-page-body">
-            {inventoryError && <p className="error">{inventoryError}</p>}
-            <section className="inventory-add-panel">
-              <div className="inventory-add-heading">
-                <h3>Adicionar máquina</h3>
-                <p className="hint">Cadastre um nome e o primeiro IP. Outros endereços, aplicações e listeners podem ser adicionados em cada máquina.</p>
-              </div>
-              <div className="cmp-form inventory-create-form">
-                <input value={newServerName} onChange={(e) => setNewServerName(e.target.value)} placeholder="Nome — ex. DNS01" />
-                <input value={newServerIp} onChange={(e) => setNewServerIp(e.target.value)} placeholder="IP — ex. 10.1.0.10" onKeyDown={(e) => e.key === 'Enter' && addInventoryServer()} />
-                <button onClick={addInventoryServer} disabled={inventoryBusy === 'server-new'}>{inventoryBusy === 'server-new' ? 'Salvando…' : 'Adicionar'}</button>
-              </div>
-            </section>
-            {inventoryLoading && <p className="hint">Carregando inventário…</p>}
-            {!inventoryLoading && !inventoryData.length && <p className="empty">Nenhuma máquina cadastrada ainda.</p>}
-            {!!inventoryData.length && (
-              <div className="inventory-workspace">
-                <section className="inventory-machine-panel">
-                  <div className="inventory-panel-head"><h3>Máquinas</h3><span className="badge low">{inventoryData.length}</span></div>
-                  <div className="inventory-machine-list">
-                    {inventoryData.map((server) => {
-                      const serverEditing = inventoryEdit?.kind === 'server' && inventoryEdit.id === server.id;
-                      return (
-                        <article key={server.id} className={`inventory-machine-row${inventorySelectedId === server.id ? ' active' : ''}`} onClick={() => setInventorySelectedId(server.id)}>
-                          <div className="inventory-machine-summary">
-                            {serverEditing ? (
-                              <input autoFocus value={inventoryEdit.name} onChange={(e) => setInventoryEdit({ ...inventoryEdit, name: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && saveInventoryEdit()} />
-                            ) : (
-                              <><b>{server.name}</b><span className="hint">ID {server.id}</span></>
-                            )}
-                          </div>
-                          <div className="inventory-machine-ips">{server.ips.map((address) => address.ip).join(' · ') || 'sem IP'}</div>
-                          <div className="inventory-machine-meta">{server.applications.length} aplicações · {server.ips.length} IPs</div>
-                          <div className="inventory-actions" onClick={(e) => e.stopPropagation()}>
-                            {serverEditing ? (
-                              <>
-                                <button className="ghost" onClick={saveInventoryEdit} disabled={inventoryBusy === `rename-server-${server.id}`}>Salvar</button>
-                                <button className="ghost" onClick={() => setInventoryEdit(null)}>Cancelar</button>
-                              </>
-                            ) : (
-                              <>
-                                <button className="ghost" onClick={() => setInventoryEdit({ kind: 'server', id: server.id, name: server.name })}>Editar</button>
-                                <button className="ghost" onClick={() => removeInventoryServer(server)}>Remover</button>
-                                <button className="inventory-add-app" onClick={() => {
-                                  setInventorySelectedId(server.id);
-                                  setApplicationDrafts((all) => ({ ...all, [server.id]: all[server.id] || { name: '', serverIpId: String(server.ips[0]?.id || ''), protocol: 'TCP', port: '' } }));
-                                  requestAnimationFrame(() => {
-                                    inventoryNewApplicationRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                    inventoryNewApplicationRef.current?.querySelector('input')?.focus({ preventScroll: true });
-                                  });
-                                }}>Adicionar aplicação</button>
-                              </>
-                            )}
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                </section>
-
-                <section className="inventory-machine-detail" id="inventory-machine-detail">
-                  <div className="inventory-list">
-                    {[selectedInventoryServer].filter(Boolean).map((server) => {
-                  const appDraft = {
-                    name: '', serverIpId: String(server.ips[0]?.id || ''), protocol: 'TCP', port: '',
-                    ...(applicationDrafts[server.id] || {})
-                  };
-                  if (!appDraft.serverIpId) appDraft.serverIpId = String(server.ips[0]?.id || '');
-                  return (
-                    <section className="inventory-server" key={server.id}>
-                      <div className="inventory-server-head">
-                        <div><b>{server.name}</b><span className="hint">{server.ips.length} IPs · {server.applications.length} aplicações</span></div>
-                      </div>
-
-                      <div className="inventory-ip-list">
-                        {server.ips.map((address) => (
-                          <div className="inventory-ip" key={address.id}>
-                            <span className="mono ip-link" title="Abrir dossiê do IP" onClick={() => openIpModal(address.ip)}>{address.ip}</span>
-                            <button className="ghost" title="Remover IP (e seus listeners)" onClick={() => removeInventoryIp(address)}>×</button>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="cmp-form inventory-add-ip">
-                        <input value={newServerIps[server.id] || ''} onChange={(e) => setNewServerIps((all) => ({ ...all, [server.id]: e.target.value }))} placeholder="Adicionar outro IP" onKeyDown={(e) => e.key === 'Enter' && addInventoryIp(server)} />
-                        <button className="ghost" onClick={() => addInventoryIp(server)} disabled={inventoryBusy === `ip-new-${server.id}`}>{inventoryBusy === `ip-new-${server.id}` ? 'Salvando…' : 'Adicionar IP'}</button>
-                      </div>
-
-                      <h4>Aplicações ({server.applications.length})</h4>
-                      <div className="cmp-form inventory-new-application" ref={inventoryNewApplicationRef}>
-                        <input value={appDraft.name} onChange={(e) => setApplicationDraft(server.id, 'name', e.target.value)} placeholder="Nome da aplicação" />
-                        <select value={appDraft.serverIpId} onChange={(e) => setApplicationDraft(server.id, 'serverIpId', e.target.value)} disabled={!server.ips.length}>
-                          {server.ips.map((address) => <option key={address.id} value={address.id}>{address.ip}</option>)}
-                        </select>
-                        <select value={appDraft.protocol} onChange={(e) => setApplicationDraft(server.id, 'protocol', e.target.value)}>
-                          <option value="TCP">TCP</option><option value="UDP">UDP</option>
-                        </select>
-                        <input type="number" min="1" max="65535" value={appDraft.port} onChange={(e) => setApplicationDraft(server.id, 'port', e.target.value)} placeholder="Porta" />
-                        <button onClick={() => addInventoryApplication(server)} disabled={!server.ips.length || inventoryBusy === `app-new-${server.id}`}>{inventoryBusy === `app-new-${server.id}` ? 'Salvando…' : 'Adicionar aplicação'}</button>
-                      </div>
-                      {!server.applications.length && <p className="hint">Nenhuma aplicação cadastrada.</p>}
-                      {server.applications.map((application) => {
-                        const appEditing = inventoryEdit?.kind === 'application' && inventoryEdit.id === application.id;
-                        const listenerDraft = {
-                          serverIpId: String(server.ips[0]?.id || ''), protocol: 'TCP', port: '',
-                          ...(listenerDrafts[application.id] || {})
-                        };
-                        if (!listenerDraft.serverIpId) listenerDraft.serverIpId = String(server.ips[0]?.id || '');
-                        return (
-                          <div className="inventory-application" key={application.id}>
-                            <div className="inventory-application-head">
-                              {appEditing ? (
-                                <input autoFocus value={inventoryEdit.name} onChange={(e) => setInventoryEdit({ ...inventoryEdit, name: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && saveInventoryEdit()} />
-                              ) : <b>{application.name}</b>}
-                              <div className="inventory-actions">
-                                {appEditing ? (
-                                  <>
-                                    <button className="ghost" onClick={saveInventoryEdit} disabled={inventoryBusy === `rename-application-${application.id}`}>Salvar</button>
-                                    <button className="ghost" onClick={() => setInventoryEdit(null)}>Cancelar</button>
-                                  </>
-                                ) : (
-                                  <>
-                                    <button className="ghost" onClick={() => setInventoryEdit({ kind: 'application', id: application.id, name: application.name })}>Renomear</button>
-                                    <button className="ghost" onClick={() => removeInventoryApplication(application)}>Remover</button>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                            <div className="inventory-expected-clients">
-                              <div className="inventory-expected-head"><b>Clientes esperados</b><span className="hint">Allowlist usada no relatório de acessos críticos</span></div>
-                              <div className="inventory-expected-list">
-                                {(application.expectedClients || []).map((client) => (
-                                  <span className="inventory-expected-client mono" key={client.id}>
-                                    {client.ip}<button className="ghost" title="Remover cliente esperado" onClick={() => removeExpectedClient(client)}>×</button>
-                                  </span>
-                                ))}
-                                {!application.expectedClients?.length && <span className="hint">Sem baseline: acessos aparecem como não classificados.</span>}
-                              </div>
-                              <div className="cmp-form inventory-expected-form">
-                                <input value={expectedClientDrafts[application.id] || ''} onChange={(e) => setExpectedClientDrafts((all) => ({ ...all, [application.id]: e.target.value }))} placeholder="IP cliente permitido" onKeyDown={(e) => e.key === 'Enter' && addExpectedClient(application)} />
-                                <button className="ghost" onClick={() => addExpectedClient(application)} disabled={inventoryBusy === `expected-client-new-${application.id}`}>{inventoryBusy === `expected-client-new-${application.id}` ? 'Salvando…' : 'Adicionar esperado'}</button>
-                              </div>
-                            </div>
-                            {application.listeners.map((listener) => (
-                              <div className="inventory-listener" key={listener.id}>
-                                <span className="mono">{listener.ip} · {listener.protocol}/{listener.port}</span>
-                                <button className="ghost" title="Remover listener" onClick={() => removeInventoryListener(listener)}>×</button>
-                              </div>
-                            ))}
-                            <div className="cmp-form inventory-listener-form">
-                              <select value={listenerDraft.serverIpId} onChange={(e) => setListenerDraft(application.id, 'serverIpId', e.target.value)} disabled={!server.ips.length}>
-                                {server.ips.map((address) => <option key={address.id} value={address.id}>{address.ip}</option>)}
-                              </select>
-                              <select value={listenerDraft.protocol} onChange={(e) => setListenerDraft(application.id, 'protocol', e.target.value)}>
-                                <option value="TCP">TCP</option><option value="UDP">UDP</option>
-                              </select>
-                              <input type="number" min="1" max="65535" value={listenerDraft.port} onChange={(e) => setListenerDraft(application.id, 'port', e.target.value)} placeholder="Porta" />
-                              <button className="ghost" onClick={() => addInventoryListener(server, application)} disabled={!server.ips.length || inventoryBusy === `listener-new-${application.id}`}>Adicionar listener</button>
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                    </section>
-                  );
-                })}
-              </div>
-                </section>
-              </div>
-            )}
-          </div>
-        </main>
-      )}
+      {inventoryOpen && <InventoryScreen {...inventoryScreenProps} />}
       {subnetsOpen && (
         <div className="modal-backdrop" onClick={() => setSubnetsOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>

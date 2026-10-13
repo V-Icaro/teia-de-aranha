@@ -557,8 +557,8 @@ async function overviewFor({ days = 7 } = {}) {
 // não tem. Só 24h de propósito — janela maior no ES é cara e o par_daily cobre.
 async function liveBytes24h() {
   try {
-    const { client, ELASTIC_INDEX, F_DST } = require('./elastic.js');
-    const r = await client.search({
+    const { searchElastic, ELASTIC_INDEX, F_DST } = require('./elastic.js');
+    const r = await searchElastic({
       index: ELASTIC_INDEX, size: 0,
       query: { bool: { filter: [{ range: { '@timestamp': { gte: 'now-24h' } } }] } },
       aggs: {

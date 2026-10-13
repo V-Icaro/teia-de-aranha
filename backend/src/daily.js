@@ -7,7 +7,7 @@
 //                      rodar 2x dá o mesmo resultado, que é o motivo de apagar
 //                      antes: somar no ON CONFLICT contaria o byte 2x)
 const { pool } = require('./db.js');
-const { client, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_DPORT } = require('./elastic.js');
+const { searchElastic, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_DPORT } = require('./elastic.js');
 const { localDay, dayRange } = require('./time.js');
 
 // Métricas: somas numéricas, o exporter não as renomeia.
@@ -16,7 +16,8 @@ const F_PACKETS = 'netflow.packetDeltaCount';
 
 const DAILY_CRON = process.env.DAILY_CRON || '40 6 * * *';
 const MAX_DAYS = Math.min(90, parseInt(process.env.DAILY_MAX_DAYS || '30', 10) || 30);
-const MAX_COMPOSITE_PAGES = 100;
+const COMPOSITE_PAGE_SIZE = Math.min(10000, Math.max(500, Number.parseInt(process.env.DAILY_COMPOSITE_PAGE_SIZE || '5000', 10) || 5000));
+const MAX_COMPOSITE_PAGES = Math.min(100, Math.max(1, Number.parseInt(process.env.DAILY_MAX_COMPOSITE_PAGES || '40', 10) || 40));
 
 function dayList(days) {
   const out = [];
@@ -75,10 +76,9 @@ async function harvestDaily(days = 7) {
     let guard = 0;
     do {
       const composite = {
-        // dport increases daily cardinality; 20k buckets keeps the retained
-        // history backfill to a handful of ES pages without approaching the
-        // cluster's default 65k aggregation bucket limit.
-        size: 20000,
+        // dport increases daily cardinality; smaller pages bound the heap and
+        // response payload for this startup/background aggregation.
+        size: COMPOSITE_PAGE_SIZE,
         sources: [
           { src: { terms: { field: F_SRC } } },
           { dst: { terms: { field: F_DST } } },
@@ -87,7 +87,7 @@ async function harvestDaily(days = 7) {
         ]
       };
       if (after) composite.after = after;
-      const resp = await client.search({
+      const resp = await searchElastic({
         index: ELASTIC_INDEX,
         size: 0,
         query: { bool: { filter: [{ range: { '@timestamp': { gte, lt } } }] } },

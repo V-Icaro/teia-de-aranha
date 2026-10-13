@@ -32,7 +32,7 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../src/db.js');
 const { init: dbInit } = require('../src/db.js');
-const { client, ELASTIC_INDEX } = require('../src/elastic.js');
+const { client, searchElastic, ELASTIC_INDEX } = require('../src/elastic.js');
 const { harvest, consultarPaises } = require('../src/regions.js');
 const { harvestDaily } = require('../src/daily.js');
 
@@ -105,7 +105,7 @@ async function backup() {
 // Dias que o ES ainda tem. O ES é a única fonte da verdade: o que expirou lá
 // não tem como voltar.
 async function diasNoES() {
-  const r = await client.search({
+  const r = await searchElastic({
     index: ELASTIC_INDEX, size: 0,
     aggs: { d: { date_histogram: { field: '@timestamp', calendar_interval: 'day', format: 'yyyy-MM-dd', time_zone: 'UTC', min_doc_count: 1 } } }
   });

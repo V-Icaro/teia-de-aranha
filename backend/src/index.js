@@ -2,7 +2,7 @@
 const net = require('node:net');
 const express = require('express');
 const cors = require('cors');
-const { client, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
+const { client, searchElastic, elasticSearchStats, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
 const { hostRisk, inboundFlows, newExternalPeers, isPrivate, windowStart } = require('./risk');
 const { topApplications, topKnownPorts, bandwidthForServer, criticalServiceAccess } = require('./dashboard');
 const { subnetOf, resolveMany, resolveIp } = require('./names');
@@ -14,16 +14,15 @@ const {
   addServerIp, deleteServerIp, createApplication, renameApplication,
   deleteApplication, addApplicationListener, deleteApplicationListener,
   addExpectedApplicationClient, deleteExpectedApplicationClient,
-  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
-  saveFortigatePolicySnapshot, fortigatePolicyHistory
+  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate
 } = require('./db');
 const { intParam } = require('./params.js');
 const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs } = require('./fortigate.js');
 const { analyzePolicies } = require('./firewallAnalysis.js');
-const { localDay, addDays, dayRange } = require('./time.js');
 const cron = require('node-cron');
 
 dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
+const DAILY_REFRESH_DAYS = Math.min(7, Math.max(2, Number.parseInt(process.env.DAILY_REFRESH_DAYS || '3', 10) || 3));
 
 // A feature "Vigilância de hosts" foi removida: cadastrar host para vigiar,
 // aprender peers e gerar achados rendeu 1.126 itens não acionados em 30 dias.
@@ -53,8 +52,8 @@ if ((process.env.DAILY_CRON || '40 6 * * *') !== '0') {
       const ok = await dbInit();
       if (!ok) return;
       const { harvestDaily, MAX_DAYS } = require('./daily.js');
-      const r = await harvestDaily(7);
-      console.log(`[daily] série diária: ${r.upserted} pares em ${r.days} dias (janela máx ${MAX_DAYS})`);
+      const r = await harvestDaily(DAILY_REFRESH_DAYS);
+      console.log(`[daily] série diária: ${r.upserted} pares em ${r.days} dias fechados (sobreposição ${DAILY_REFRESH_DAYS - 1}d; janela máx ${MAX_DAYS})`);
     } catch (e) {
       console.error(`[daily] falha na série diária: ${e.message}`);
     }
@@ -62,28 +61,18 @@ if ((process.env.DAILY_CRON || '40 6 * * *') !== '0') {
   console.log(`[daily] agendado: ${process.env.DAILY_CRON || '40 6 * * *'}`);
 }
 
-const FORTIGATE_HISTORY_CRON = process.env.FORTIGATE_HISTORY_CRON || '15 * * * *';
-if (FORTIGATE_HISTORY_CRON !== '0') {
-  cron.schedule(FORTIGATE_HISTORY_CRON, async () => {
-    try {
-      const result = await collectFortigateSnapshots();
-      if (result.firewalls) console.log(`[fortigate] snapshots: ${result.policies} políticas em ${result.firewalls} firewall(s)`);
-    } catch (e) {
-      console.error(`[fortigate] falha ao coletar snapshots: ${e.message}`);
-    }
-  }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
-  console.log(`[fortigate] histórico agendado: ${FORTIGATE_HISTORY_CRON}`);
-}
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
-// Sem teto por padrão (MAX_EDGES só como trava opcional de emergência)
-const MAX_EDGES = parseInt(process.env.MAX_EDGES || '', 10) || Infinity;
+// Protege o ES e o heap do Node contra janelas/cardinalidades extremas. MAX_EDGES=0
+// mantém a paginação ilimitada para instalações que conscientemente precisem dela.
+const maxEdgesRaw = process.env.MAX_EDGES;
+const maxEdgesParsed = Number.parseInt(maxEdgesRaw ?? '50000', 10);
+const MAX_EDGES = maxEdgesRaw === '0' ? Infinity : Number.isSafeInteger(maxEdgesParsed) && maxEdgesParsed > 0 ? maxEdgesParsed : 50000;
 const ACTIVE_WINDOW_SEC = parseInt(process.env.ACTIVE_WINDOW_SEC || '120', 10);
-const COMPOSITE_PAGE_SIZE = parseInt(process.env.COMPOSITE_PAGE_SIZE || '1000', 10);
+const COMPOSITE_PAGE_SIZE = Math.min(2000, Math.max(100, parseInt(process.env.COMPOSITE_PAGE_SIZE || '1000', 10) || 1000));
 
 
 // Janela efetiva da query, para a resposta dizer a verdade. `minutes` sozinho
@@ -270,27 +259,6 @@ async function fortigateCredentials(id) {
   return { firewall, credentials: { host: firewall.host, token: firewall.token, vdom: firewall.vdom || 'root' } };
 }
 
-async function captureFortigateSnapshot(id) {
-  const { credentials } = await fortigateCredentials(id);
-  const result = await fetchPolicies(credentials);
-  return saveFortigatePolicySnapshot(id, result.policies, new Date());
-}
-
-async function collectFortigateSnapshots() {
-  if (!(await dbInit())) throw new Error('Postgres indisponível');
-  const firewalls = await listFortigates();
-  let policies = 0;
-  for (const firewall of firewalls) {
-    try {
-      const snapshot = await captureFortigateSnapshot(firewall.id);
-      policies += snapshot.policies;
-    } catch (e) {
-      console.error(`[fortigate] snapshot falhou para ${firewall.name} (${firewall.host}): ${e.message}`);
-    }
-  }
-  return { firewalls: firewalls.length, policies };
-}
-
 app.post('/api/fortigate/:id/test', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
@@ -301,59 +269,6 @@ app.post('/api/fortigate/:id/test', async (req, res) => {
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao testar FortiGate', detail: String(e.message || e) });
-  }
-});
-
-app.post('/api/fortigate/:id/snapshot', async (req, res) => {
-  try {
-    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
-    res.json(await captureFortigateSnapshot(id));
-  } catch (e) {
-    if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao coletar snapshot FortiGate', detail: String(e.message || e) });
-  }
-});
-
-app.get('/api/fortigate/:id/history', async (req, res) => {
-  try {
-    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
-    const { firewall } = await fortigateCredentials(id);
-    let from;
-    let to;
-    if (req.query.from !== undefined || req.query.to !== undefined) {
-      const fromDay = String(req.query.from || '');
-      const toDay = String(req.query.to || '');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDay) || !/^\d{4}-\d{2}-\d{2}$/.test(toDay)) {
-        return res.status(400).json({ error: 'from e to devem estar no formato YYYY-MM-DD.' });
-      }
-      const fromUtcDay = new Date(`${fromDay}T00:00:00Z`);
-      const toUtcDay = new Date(`${toDay}T00:00:00Z`);
-      if (Number.isNaN(fromUtcDay.getTime()) || Number.isNaN(toUtcDay.getTime())
-        || fromUtcDay.toISOString().slice(0, 10) !== fromDay || toUtcDay.toISOString().slice(0, 10) !== toDay) {
-        return res.status(400).json({ error: 'from/to não são datas válidas.' });
-      }
-      if (fromDay > toDay) return res.status(400).json({ error: 'from não pode ser posterior a to.' });
-      if ((toUtcDay.getTime() - fromUtcDay.getTime()) / 86400000 + 1 > 90) {
-        return res.status(400).json({ error: 'O intervalo personalizado não pode exceder 90 dias.' });
-      }
-      from = dayRange(fromDay).start;
-      to = dayRange(toDay).end;
-    } else {
-      const days = intParam(req.query.days, { nome: 'days', def: 30, min: 1, max: 90 });
-      const firstDay = addDays(localDay(new Date()), -(days - 1));
-      from = dayRange(firstDay).start;
-      to = new Date().toISOString();
-    }
-    const limit = intParam(req.query.limit, { nome: 'limit', def: 100, min: 1, max: 500 });
-    const offset = intParam(req.query.offset, { nome: 'offset', def: 0, min: 0, max: Number.MAX_SAFE_INTEGER });
-    const sort = ['bytes', 'hits', 'packets', 'position'].includes(String(req.query.sort)) ? String(req.query.sort) : 'bytes';
-    const history = await fortigatePolicyHistory(id, { from, to, sort, limit, offset });
-    res.json({ firewall: { id, name: firewall.name, host: firewall.host, vdom: firewall.vdom }, ...history });
-  } catch (e) {
-    if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar histórico FortiGate', detail: String(e.message || e) });
   }
 });
 
@@ -409,7 +324,7 @@ app.get('/api/fortigate/:id/analysis', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   try {
     const ping = await client.ping();
-    res.json({ ok: true, elastic: ELASTIC_INDEX, ping, build: '2026-09-29d' });
+    res.json({ ok: true, elastic: ELASTIC_INDEX, ping, searches: elasticSearchStats(), build: '2026-09-29d' });
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e.message || e) });
   }
@@ -514,7 +429,7 @@ app.get('/api/host/:ip', async (req, res) => {
       const pk = `${b.key.porta_orig ?? '?'}>${b.key.porta_dest ?? '?'}`;
       const pm = isSrc ? peers[peer].outPairs : peers[peer].inPairs;
       const pe = pm.get(pk) || { sport: b.key.porta_orig ?? null, dport: b.key.porta_dest ?? null, bytes: 0, flows: 0 };
-      pe.bytes += bytes; pe.flows += 1;
+      pe.bytes += bytes; pe.flows += b.doc_count || 0;
       pm.set(pk, pe);
       const fs = b.firstSeen?.value_as_string ? Date.parse(b.firstSeen.value_as_string) : (b.firstSeen?.value || null);
       const ls = b.lastSeen?.value_as_string ? Date.parse(b.lastSeen.value_as_string) : (b.lastSeen?.value || null);
@@ -554,7 +469,7 @@ app.get('/api/host/:ip', async (req, res) => {
         const range = req.query.from
           ? { '@timestamp': { gte: req.query.from, ...(req.query.to ? { lte: req.query.to } : {}) } }
           : { '@timestamp': { gte: `now-${intParam(req.query.minutes, { nome: 'minutes', def: 15, min: 1, max: 10080 })}m` } };
-        const pc = await client.search({ index: ELASTIC_INDEX, size: 0,
+        const pc = await searchElastic({ index: ELASTIC_INDEX, size: 0,
           query: { bool: { filter: [{ range }, { bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 } }] } },
           aggs: { s: { terms: { field: F_SRC, size: 2000 } }, d: { terms: { field: F_DST, size: 2000 } } } });
         const set = new Set([
@@ -572,6 +487,7 @@ app.get('/api/host/:ip', async (req, res) => {
       inventory,
       activeOnly,
       windowPeers,
+      truncated: buckets.truncated || false,
       totalInBytes: Math.round(inBytes),
       totalOutBytes: Math.round(outBytes),
       totalInPackets: Math.round(inPackets),
@@ -815,13 +731,13 @@ app.get('/api/ip/:ip', async (req, res) => {
       const pkts = b.pacotes?.value || 0;
       const isSrc = String(b.key.origem) === ip;
       const peer = isSrc ? String(b.key.destino) : String(b.key.origem);
-      flows += 1;
+      flows += b.doc_count || 0;
       if (isSrc) { outBytes += bytes; outPackets += pkts; } else { inBytes += bytes; inPackets += pkts; }
       const dp = b.key.porta_dest ?? null;
       dports[dp] = dports[dp] || { port: dp, bytes: 0, flows: 0 };
-      dports[dp].bytes += bytes; dports[dp].flows += 1;
+      dports[dp].bytes += bytes; dports[dp].flows += b.doc_count || 0;
       peers[peer] = peers[peer] || { ip: peer, bytes: 0, flows: 0, ports: new Set() };
-      peers[peer].bytes += bytes; peers[peer].flows += 1;
+      peers[peer].bytes += bytes; peers[peer].flows += b.doc_count || 0;
       if (dp != null) peers[peer].ports.add(dp);
     }
 
@@ -842,6 +758,7 @@ app.get('/api/ip/:ip', async (req, res) => {
         inPackets: Math.round(inPackets),
         outPackets: Math.round(outPackets),
         flows,
+        truncated: buckets.truncated || false,
         topPeers: Object.values(peers)
           .map((p) => ({ ip: p.ip, bytes: Math.round(p.bytes), flows: p.flows, ports: [...p.ports].slice(0, 10) }))
           .sort((a, b) => b.bytes - a.bytes).slice(0, 10),
@@ -882,10 +799,10 @@ app.get('/api/compare', async (req, res) => {
       const fwd = String(x.key.origem) === a; // A->B ?
       const d = fwd ? dir.aToB : dir.bToA;
       const bytes = x.bytes?.value || 0;
-      d.bytes += bytes; d.packets += x.pacotes?.value || 0; d.flows += 1;
+      d.bytes += bytes; d.packets += x.pacotes?.value || 0; d.flows += x.doc_count || 0;
       const p = x.key.porta_dest ?? 'null';
       d.ports[p] = d.ports[p] || { port: x.key.porta_dest ?? null, bytes: 0, flows: 0 };
-      d.ports[p].bytes += bytes; d.ports[p].flows += 1;
+      d.ports[p].bytes += bytes; d.ports[p].flows += x.doc_count || 0;
     }
     const fmtDir = (d) => ({
       bytes: Math.round(d.bytes), packets: Math.round(d.packets), flows: d.flows,
@@ -896,7 +813,7 @@ app.get('/api/compare', async (req, res) => {
     // Timeline: 1 consulta com 2 filtros (A->B e B->A)
     const interval = minutes <= 30 ? '1m' : minutes <= 180 ? '5m' : minutes <= 720 ? '15m' : '1h';
     const range = { '@timestamp': { gte: from, lte: to } };
-    const t = await client.search({ index: ELASTIC_INDEX, size: 0, query: { bool: { filter: [{ range }] } },
+    const t = await searchElastic({ index: ELASTIC_INDEX, size: 0, query: { bool: { filter: [{ range }] } },
       aggs: {
         aToB: { filter: { bool: { filter: [
           { term: { [process.env.ELASTIC_FIELD_SRC || 'netflow.sourceIPv4Address.keyword']: a } },
@@ -914,7 +831,7 @@ app.get('/api/compare', async (req, res) => {
       t: x.key_as_string, aToB: Math.round(x.bytes.value || 0), bToA: ba[x.key] || 0
     }));
 
-    res.json({ a, b, from, to, interval,
+    res.json({ a, b, from, to, interval, truncated: buckets.truncated || false,
       aToB: fmtDir(dir.aToB), bToA: fmtDir(dir.bToA), timeline });
   } catch (e) {
     if (!e.status) console.error(e);
@@ -1212,7 +1129,7 @@ app.get('/api/lookup', async (req, res) => {
     ];
     const peerAggs = (field) => ({ terms: { field, size: 20 },
       aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } });
-    const r = await client.search({ index: ELASTIC_INDEX, size: 0,
+    const r = await searchElastic({ index: ELASTIC_INDEX, size: 0,
       query: { bool: { filter: base } },
       aggs: {
         first: { min: { field: '@timestamp' } },
@@ -1299,17 +1216,6 @@ app.post('/api/stats/harvest', async (req, res) => {
 
 app.listen(PORT, () => console.log(`Backend rodando em http://localhost:${PORT} (indice ${ELASTIC_INDEX})`));
 
-if (FORTIGATE_HISTORY_CRON !== '0') {
-  setTimeout(async () => {
-    try {
-      const result = await collectFortigateSnapshots();
-      if (result.firewalls) console.log(`[fortigate] snapshot inicial: ${result.policies} políticas em ${result.firewalls} firewall(s)`);
-    } catch (e) {
-      console.error(`[fortigate] falha no snapshot inicial: ${e.message}`);
-    }
-  }, 8000);
-}
-
 // Recuperação da série diária usada no gráfico da tela de Reputação. O job das
 // 06:40 só roda se o processo estiver no ar naquele minuto; na subida, regravamos
 // os dias fechados que faltam. harvestDaily() apaga e regrava o dia idempotentemente.
@@ -1321,7 +1227,9 @@ if ((process.env.DAILY_CRON || '40 6 * * *') !== '0' && process.env.DAILY_BACKFI
     try {
       if (!(await dbInit())) return;
       const { harvestDaily, missingDays } = require('./daily.js');
-      const faltando = await missingDays({ max: 7 });
+      // Recupera poucos dias por subida para não concentrar um backfill grande
+      // no instante em que o backend e o Elasticsearch estão aquecendo.
+      const faltando = await missingDays({ max: 3 });
       if (!faltando.length) return;
       console.log(`[daily] ${faltando.length} dia(s) sem serie: ${faltando.join(', ')} - recuperando`);
       const r = await harvestDaily(faltando);

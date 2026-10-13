@@ -29,21 +29,29 @@ Variáveis (`.env`):
 | ELASTIC_API_KEY | — | alternativa ao basic auth |
 | ELASTIC_INDEX | netflow-* | índice NetFlow |
 | PORT | 3001 | porta do Express |
-| MAX_EDGES | 5000 | teto p/ não travar o browser |
+| MAX_EDGES | 50000 | teto de buckets por mapa/host; `0` desliga o limite |
+| MAX_SPORT_BUCKETS | 10000 | teto menor para detalhes com porta de origem (host/dossiê/comparador) |
 | COMPOSITE_PAGE_SIZE | 1000 | página da agg composite |
+| ELASTIC_MAX_CONCURRENT_SEARCHES | 3 | buscas ES simultâneas por processo |
+| ELASTIC_MAX_QUEUED_SEARCHES | 24 | fila máxima antes de responder 503 quando o ES está ocupado |
+| ELASTIC_SEARCH_QUEUE_TIMEOUT_MS | 15000 | tempo máximo na fila do ES |
+| ELASTIC_MAX_RETRIES | 1 | tentativas adicionais do cliente ES |
+| ELASTIC_REQUEST_TIMEOUT_MS | 120000 | timeout da requisição ES após a conexão |
+| ELASTIC_SLOW_SEARCH_WARN_MS | 30000 | registra no backend consultas ES lentas a partir deste tempo |
+| MAX_SPORT_BUCKETS | 10000 | limite menor em detalhes que incluem porta de origem |
+| DAILY_REFRESH_DAYS | 3 | janela reprocessada pelo cron diário (2 dias fechados; permite atraso do exporter) |
+| DAILY_COMPOSITE_PAGE_SIZE / DAILY_MAX_COMPOSITE_PAGES | 5000 / 40 | limites do backfill diário (até 200 mil buckets/dia) |
 | BANDWIDTH_FLOW_DIRECTION | both | direção contada na Banda: `both`, `ingress` ou `egress` (decida pelo `/api/diagnostics/duplication`) |
 | BANDWIDTH_TIME_MARGIN_MS | 120000 | margem do filtro de tempo da Banda (a série usa o fim do fluxo) |
 | FORTIGATE_KEY | — | chave do AES-256-GCM que cifra o token da API do FortiGate no Postgres (64 hex ou passphrase) |
 | FORTIGATE_TIMEOUT_MS | 8000 | timeout das chamadas HTTPS ao FortiGate |
-| FORTIGATE_HISTORY_CRON | `15 * * * *` | frequência dos snapshots dos contadores cumulativos do FortiGate; `0` desliga |
-| FORTIGATE_HISTORY_RETENTION_DAYS | 120 | retenção local de snapshots por política |
 | REPORT_TZ | America/Fortaleza | fuso dos "dias" das séries diárias (`pair_daily`, `ip_daily`, acessos críticos, série da Reputação) |
 
 > **Fuso dos relatórios:** o "dia" das séries diárias é o **dia local** (`REPORT_TZ`), não UTC — em UTC-3 o dia virava às 21h. Só os dias novos passam a usar o dia local; as linhas **já gravadas** em dia UTC **não** são migradas automaticamente (reprocessar dias ainda retidos no ES é possível via backfill, ver abaixo). Por isso, ao trocar o fuso, pode haver um degrau entre o último dia UTC e o primeiro local.
 
 Endpoints:
 
-- `GET /api/health` — ping no ES
+- `GET /api/health` — ping no ES e estado da fila global de buscas (`active`, `queued`, `maxConcurrent`)
 - `GET /api/graph?minutes=15` — grafo Cytoscape `{ nodes, edges, meta }`
   - ou `?minutes=5|60`, `?range=now-1h`, `?from=ISO&to=ISO`
 - `GET /api/host/:ip?minutes=15` — detalhe do nó (in/out bytes, peers, portas, protocolos); `&active=1` mostra só conexões com pacote nos últimos `ACTIVE_WINDOW_SEC` (padrão 120s); cada peer traz `active`, `firstSeen` (primeira vista **na janela**) e `lastSeen`
@@ -56,8 +64,6 @@ Endpoints:
 - `GET /api/dashboard/critical-access?days=30` — clientes das portas TCP críticas (22, 445, 1433, 3389, 5985), primeira/última aparição e comparação com allowlist por aplicação. A resposta devolve `portHistoryStart`, dias cobertos e `novelty` (`new`, `known-pair-new-port`, `baseline`); `isNew` só é verdadeiro para `new`.
 - `GET /api/dashboard/conversations?top=5&time=1h&flowType=ingress` — top 1–20 conversas envolvendo IPs do inventário; `time` aceita `1h`, `6h` ou `24h`, e `flowType` aceita `ingress`, `egress` ou `both`. SYN/SYN-ACK orientam cliente/servidor quando observados; `flowDirection` é retornado como direção no exportador.
 - `/api/fortigate` — GET/POST/PATCH/DELETE de firewalls FortiGate. O token é cifrado com AES-256-GCM (`FORTIGATE_KEY` no servidor) e a API só devolve `hasToken`, nunca o valor. `GET /api/fortigate/:id/policies?limit=20&sort=hits&offset=0` consulta `GET /api/v2/monitor/firewall/policy` (header `Authorization: Bearer`, TLS ignorado como curl `-k`) e devolve as políticas ordenadas por `hits`, `bytes`, `packets` ou `sessions`, com paginação por `offset` (a resposta traz `total`, `page` e `pages`); `POST /api/fortigate/:id/test` verifica conectividade e quantidade de políticas. `GET /api/fortigate/:id/analysis?staleDays=90` cruza a configuração (CMDB `firewall/policy`, na ordem efetiva) com o uso (monitor) e devolve sugestões justificadas (`severity`, `confidence`, `impact`, `changeRisk`, `evidence`, `recommendation`, `validation`); é somente leitura e não aplica nada no equipamento.
-- Histórico FortiGate: `GET /api/fortigate/:id/history?days=30` ou `?from=YYYY-MM-DD&to=YYYY-MM-DD` resume hits/bytes/pacotes pelas diferenças entre snapshots locais; `POST /api/fortigate/:id/snapshot` coleta uma amostra imediata. Snapshots são coletados pelo `FORTIGATE_HISTORY_CRON` (padrão de hora em hora) e retidos por `FORTIGATE_HISTORY_RETENTION_DAYS` (120 dias). O histórico começa na primeira coleta; não recria retroativamente dados anteriores.
-- `GET /api/fortigate/:id/history?days=30` ou `?from=YYYY-MM-DD&to=YYYY-MM-DD` resume hits/bytes/pacotes pela diferença entre snapshots locais; `POST /api/fortigate/:id/snapshot` coleta um snapshot imediato. A coleta automática usa `FORTIGATE_HISTORY_CRON` (padrão de hora em hora). A série `1_week_ipv4` do monitor FortiGate continua sendo apenas semanal; snapshots locais passam a formar histórico a partir da primeira coleta, sem retroagir meses anteriores.
 - `POST /api/reputation {ips}` — reputação de IPs públicos só via AbuseIPDB: 🟢 confiável (score 0) / 🔴 não confiável (score > 0); sem chave = não verificado. Só gasta cota no que não está no cache (6h em memória, 7 dias no Postgres — alimentado pela coleta diária das 06:15)
 - `POST /api/reputation/coverage {ips}` — o que já está no cache, com a idade de cada veredito e o estado da cota; **não** chama o AbuseIPDB (é o que faz o botão "Verificar N IPs sem cache" só consultar o que falta)
 - `GET /api/reputation/overview?days=1|7|30|0` — painel da tela de Reputação: IPs públicos vistos no período, quantos têm score > 0, % do byte que foi para score > 0, cobertura (com/sem veredito), faixa de score (donut), contexto de uso (hospedagem × operadora × institucional), países/ISPs com IP ruim e bytes por dia. O score é o de hoje aplicado ao histórico; bytes de 24h vêm do ES e de 7/30/base de `pair_daily` (só dia fechado)

@@ -6,7 +6,7 @@
 // Risco = participação do volume que foi para IP com score>0, ponderada pelo
 // próprio score (score 10 não pesa como 90). É 0..1, comparável entre hosts.
 const { pool } = require('./db.js');
-const { client, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_DPORT, F_FEND, buildTimeRange } = require('./elastic.js');
+const { searchElastic, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_DPORT, F_FEND, buildTimeRange } = require('./elastic.js');
 
 // Métricas: somas são numéricas e o exporter não as renomeia (ao contrário dos
 // campos de IP/porta, que podem ser text+keyword). Deixamos literais.
@@ -113,7 +113,7 @@ async function hostRisk(query, { maxPairs = 12000 } = {}) {
     const pageSize = Math.min(2000, maxPairs - pairs);
     if (pageSize <= 0) {
       if (after) {
-        const probe = await client.search({
+        const probe = await searchElastic({
           index: ELASTIC_INDEX, size: 0,
           query: { bool: { filter: [{ range: buildTimeRange(query) }] } },
           aggs: { pares: { composite: { size: 1, after, sources: [
@@ -134,7 +134,7 @@ async function hostRisk(query, { maxPairs = 12000 } = {}) {
     };
     if (after) composite.after = after;
 
-    const resp = await client.search({
+    const resp = await searchElastic({
       index: ELASTIC_INDEX,
       size: 0,
       query: { bool: { filter: [{ range: buildTimeRange(query) }] } },
@@ -334,7 +334,7 @@ async function inboundFlows(query, { maxBuckets = 20000 } = {}) {
     const remaining = maxBuckets - buckets.length;
     if (remaining <= 0) {
       if (after) {
-        const probe = await client.search({
+        const probe = await searchElastic({
           index: ELASTIC_INDEX, size: 0, query: baseQuery,
           aggs: { inbound: { composite: { size: 1, after, sources: [
             { origem: { terms: { field: F_SRC } } },
@@ -355,7 +355,7 @@ async function inboundFlows(query, { maxBuckets = 20000 } = {}) {
       ]
     };
     if (after) composite.after = after;
-    const resp = await client.search({
+    const resp = await searchElastic({
       index: ELASTIC_INDEX, size: 0, query: baseQuery,
       aggs: {
         inbound: {
@@ -408,7 +408,7 @@ async function newExternalPeers(query, { maxPairs = 4000 } = {}) {
     const remaining = maxPairs - afterPages.length;
     if (remaining <= 0) {
       if (after) {
-        const probe = await client.search({
+        const probe = await searchElastic({
           index: ELASTIC_INDEX, size: 0,
           query: { bool: { filter: [{ range: buildTimeRange(query) }] } },
           aggs: { pares: { composite: { size: 1, after, sources: [
@@ -428,7 +428,7 @@ async function newExternalPeers(query, { maxPairs = 4000 } = {}) {
       ]
     };
     if (after) composite.after = after;
-    const resp = await client.search({
+    const resp = await searchElastic({
       index: ELASTIC_INDEX,
       size: 0,
       query: { bool: { filter: [{ range: buildTimeRange(query) }] } },

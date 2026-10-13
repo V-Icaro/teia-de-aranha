@@ -73,9 +73,26 @@ Agregação `composite` (a que você passou, estendida):
 - Filtro opcional de ativas (`activeSec`): `flowEndMilliseconds >= now-Ns`.
   "Ativa" = teve pacote nos últimos N segundos (padrão 120s). Cobre sessão
   aberta (o exporter reexporta por *active timeout*) e recém-encerrada.
-- **Sem teto:** pagina `after_key` até esgotar (`MAX_EDGES` só como trava
-  opcional de emergência; padrão `Infinity`). Retorna `truncated: true` se
-  algum teto cortar.
+- **Limite de segurança:** pagina `after_key` até `MAX_EDGES` (padrão 50.000
+  buckets; `MAX_EDGES=0` volta ao modo sem teto). Ao atingir o teto, faz uma
+  consulta de prova para distinguir uma última página cheia de truncamento real.
+  `meta.truncated` e o mapa avisam quando o conjunto ficou parcial.
+
+### Controle de carga das consultas ES
+
+Todas as buscas do backend passam por `searchElastic()`, uma fila global que
+permite até `ELASTIC_MAX_CONCURRENT_SEARCHES` (padrão 3) buscas simultâneas,
+mantém no máximo `ELASTIC_MAX_QUEUED_SEARCHES` (24) esperando e devolve HTTP 503
+com mensagem explícita quando a fila fica cheia ou expira. Isso limita a
+concorrência entre mapa, Dashboard, Exposição e jobs; as páginas de um mesmo
+composite continuam sequenciais por `after_key`.
+
+O backfill diário usa páginas menores (`DAILY_COMPOSITE_PAGE_SIZE=5000`) e para
+em `DAILY_MAX_COMPOSITE_PAGES=40` (200 mil buckets por dia). Se o teto for
+atingido, o dia falha antes de apagar/substituir os dados existentes. A
+recuperação automática na inicialização tenta no máximo três dias por subida. O
+mapa tem teto próprio de 50 mil buckets por consulta; reduza a janela se aparecer
+o aviso de resultado parcial.
 
 ### 2.4. Grafo — `toCytoscape()` (`src/elastic.js`)
 
@@ -408,6 +425,12 @@ Decisões da série:
    que não houve fluxo ou que a coleta não rodou; a tela de Reputação sinaliza
     os dias disponíveis em vez de inventar um zero.
 
+O cron diário reprocessa `DAILY_REFRESH_DAYS` (padrão 3: os dois últimos dias
+fechados) para cobrir atraso curto do exporter, em vez de reler seis dias a cada
+execução. O limite de composite é `DAILY_COMPOSITE_PAGE_SIZE` ×
+`DAILY_MAX_COMPOSITE_PAGES` (padrão 200 mil buckets/dia); se exceder, a transação
+do dia não substitui os dados existentes.
+
 Depois da migração, reprocessar dias ainda retidos no ES para preencher `dport`:
 `cd backend && node scripts/backfill-pair-daily-ports.js 30 --confirm`.
 Histórico que já expirou no ES fica com porta desconhecida (`0`) e não pode ser
@@ -485,16 +508,6 @@ janela semanal devolvida pelo FortiOS. Por isso, zeros na tela significam que o
 contador atual está em zero, não que a política nunca tenha sido usada nem que
 não teve uso num mês específico.
 
-Para resumir um intervalo histórico, o backend grava snapshots locais dos
-contadores por política (padrão: `FORTIGATE_HISTORY_CRON=15 * * * *`) e soma as
-diferenças entre amostras. A tela oferece 7/30/90 dias e datas de início/fim;
-`GET /api/fortigate/:id/history?days=30` e `?from=YYYY-MM-DD&to=YYYY-MM-DD`
-retornam hits/bytes/pacotes do período. Se o contador diminuiu entre amostras,
-isso é contado como reset e sinalizado na coluna de resets. **Esse histórico
-começa na primeira coleta local e não pode reconstruir retroativamente os 30
-dias anteriores**; a tela informa a cobertura real até que haja amostras
-suficientes. `POST /api/fortigate/:id/snapshot` coleta uma amostra imediata.
-Snapshots são mantidos por `FORTIGATE_HISTORY_RETENTION_DAYS` (padrão 120 dias).
 
 ### 3.9. Análise de políticas (`backend/src/firewallAnalysis.js`)
 

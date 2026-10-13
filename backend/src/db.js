@@ -5,7 +5,6 @@
 // ip_sightings, pair_daily e ip_reputation.
 const { Pool } = require('pg');
 const { encrypt, decrypt } = require('./crypto.js');
-const FORTIGATE_HISTORY_RETENTION_DAYS = Math.max(30, Number.parseInt(process.env.FORTIGATE_HISTORY_RETENTION_DAYS || '120', 10) || 120);
 
 const pool = new Pool(
   process.env.DATABASE_URL
@@ -184,21 +183,6 @@ async function init() {
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-        CREATE TABLE IF NOT EXISTS fortigate_policy_snapshots (
-          fortigate_id BIGINT NOT NULL REFERENCES fortigate(id) ON DELETE CASCADE,
-          policyid BIGINT NOT NULL,
-          policy_name TEXT,
-          position INTEGER,
-          captured_at TIMESTAMPTZ NOT NULL,
-          hit_count BIGINT NOT NULL DEFAULT 0,
-          bytes BIGINT NOT NULL DEFAULT 0,
-          packets BIGINT NOT NULL DEFAULT 0,
-          first_used BIGINT,
-          last_used BIGINT,
-          PRIMARY KEY (fortigate_id, policyid, captured_at)
-        );
-        CREATE INDEX IF NOT EXISTS idx_fgt_snapshots_time ON fortigate_policy_snapshots (fortigate_id, captured_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_fgt_snapshots_policy ON fortigate_policy_snapshots (fortigate_id, policyid, captured_at DESC);
       `);
     } finally {
       c.release();
@@ -569,123 +553,6 @@ async function deleteFortigate(id) {
   return { ok: true, id: Number(id) };
 }
 
-async function saveFortigatePolicySnapshot(fortigateId, policies, capturedAt = new Date()) {
-  const timestamp = capturedAt instanceof Date ? capturedAt.toISOString() : new Date(capturedAt).toISOString();
-  const rows = (policies || []).filter((policy) => Number(policy.policyid) > 0).map((policy) => [
-    fortigateId, Number(policy.policyid), policy.name || null, Number(policy.position) || null,
-    timestamp, Math.max(0, Math.trunc(Number(policy.hitCount) || 0)),
-    Math.max(0, Math.trunc(Number(policy.bytes) || 0)), Math.max(0, Math.trunc(Number(policy.packets) || 0)),
-    policy.firstUsed || null, policy.lastUsed || null
-  ]);
-  if (!rows.length) return { capturedAt: timestamp, policies: 0 };
-  const c = await pool.connect();
-  try {
-    await c.query('begin');
-    for (let i = 0; i < rows.length; i += 500) {
-      const batch = rows.slice(i, i + 500);
-      const params = [];
-      const values = batch.map((row) => {
-        const base = params.length;
-        params.push(...row);
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::timestamptz, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`;
-      });
-      await c.query(
-        `insert into fortigate_policy_snapshots
-           (fortigate_id, policyid, policy_name, position, captured_at, hit_count, bytes, packets, first_used, last_used)
-         values ${values.join(', ')}
-         on conflict (fortigate_id, policyid, captured_at) do update set
-           policy_name = excluded.policy_name, position = excluded.position,
-           hit_count = excluded.hit_count, bytes = excluded.bytes, packets = excluded.packets,
-           first_used = excluded.first_used, last_used = excluded.last_used`,
-        params
-      );
-    }
-    await c.query(
-      `delete from fortigate_policy_snapshots
-        where fortigate_id = $1 and captured_at < now() - ($2::int * interval '1 day')`,
-      [fortigateId, FORTIGATE_HISTORY_RETENTION_DAYS]
-    );
-    await c.query('commit');
-  } catch (error) {
-    await c.query('rollback').catch(() => {});
-    throw error;
-  } finally {
-    c.release();
-  }
-  return { capturedAt: timestamp, policies: rows.length };
-}
-
-async function fortigatePolicyHistory(fortigateId, { from, to, sort = 'bytes', limit = 100, offset = 0 } = {}) {
-  const safeSort = { bytes: 'bytes', hits: 'hits', packets: 'packets', position: 'position' }[sort] || 'bytes';
-  const order = safeSort === 'position' ? 'position ASC NULLS LAST' : `${safeSort} DESC NULLS LAST`;
-  const { rows } = await pool.query(
-    `with before_window as (
-       select distinct on (policyid) policyid, policy_name, position, captured_at,
-              hit_count, bytes, packets, first_used, last_used
-         from fortigate_policy_snapshots
-        where fortigate_id = $1 and captured_at < $2::timestamptz
-        order by policyid, captured_at desc
-     ), in_window as (
-       select policyid, policy_name, position, captured_at,
-              hit_count, bytes, packets, first_used, last_used
-         from fortigate_policy_snapshots
-        where fortigate_id = $1 and captured_at >= $2::timestamptz and captured_at < $3::timestamptz
-     ), samples as (
-       select * from before_window union all select * from in_window
-     ), deltas as (
-       select *,
-              lag(hit_count) over (partition by policyid order by captured_at) as prev_hits,
-              lag(bytes) over (partition by policyid order by captured_at) as prev_bytes,
-              lag(packets) over (partition by policyid order by captured_at) as prev_packets
-         from samples
-     ), totals as (
-       select policyid, max(policy_name) as name, max(position)::int as position,
-              coalesce(sum(case when prev_hits is null then 0 when hit_count >= prev_hits then hit_count - prev_hits else hit_count end)
-                filter (where captured_at >= $2::timestamptz), 0)::bigint as hits,
-              coalesce(sum(case when prev_bytes is null then 0 when bytes >= prev_bytes then bytes - prev_bytes else bytes end)
-                filter (where captured_at >= $2::timestamptz), 0)::bigint as bytes,
-              coalesce(sum(case when prev_packets is null then 0 when packets >= prev_packets then packets - prev_packets else packets end)
-                filter (where captured_at >= $2::timestamptz), 0)::bigint as packets,
-              sum(case when prev_bytes is not null and bytes < prev_bytes then 1 else 0 end)
-                filter (where captured_at >= $2::timestamptz)::int as counter_resets,
-              count(*) filter (where captured_at >= $2::timestamptz)::int as samples,
-              min(captured_at) filter (where captured_at >= $2::timestamptz) as first_sample,
-              max(captured_at) filter (where captured_at >= $2::timestamptz) as last_sample
-         from deltas
-        where captured_at >= $2::timestamptz and captured_at < $3::timestamptz
-        group by policyid
-     )
-     select totals.*, count(*) over ()::int as total_policies
-       from totals
-      order by ${order}, policyid
-      limit $4 offset $5`,
-    [fortigateId, from, to, limit, offset]
-  );
-  const first = rows[0];
-  const coverageResult = await pool.query(
-    `select min(captured_at) as coverage_start,
-            count(distinct captured_at) filter (where captured_at >= $2::timestamptz and captured_at < $3::timestamptz)::int as snapshots
-       from fortigate_policy_snapshots where fortigate_id = $1`,
-    [fortigateId, from, to]
-  );
-  const coverageStart = coverageResult.rows[0]?.coverage_start || null;
-  const snapshots = Number(coverageResult.rows[0]?.snapshots || 0);
-  return {
-    from, to, sort: safeSort,
-    coverageStart,
-    snapshots,
-    total: Number(first?.total_policies || 0),
-    limit, offset,
-    coverageStartedBefore: Boolean(snapshots > 0 && coverageStart && new Date(coverageStart).getTime() <= new Date(from).getTime()),
-    policies: rows.map((row) => ({
-      policyid: Number(row.policyid), name: row.name, position: row.position,
-      hits: Number(row.hits || 0), bytes: Number(row.bytes || 0), packets: Number(row.packets || 0),
-      counterResets: Number(row.counter_resets || 0), samples: Number(row.samples || 0),
-      firstSnapshot: row.first_sample, lastSnapshot: row.last_sample
-    }))
-  };
-}
-
 module.exports = {
   pool, init, listSubnets, addSubnet, patchSubnet, delSubnet,
   listInventory, inventoryNamesFor, inventoryNameFor, inventoryApplicationsForIp,
@@ -693,6 +560,5 @@ module.exports = {
   addServerIp, deleteServerIp, createApplication, renameApplication,
   deleteApplication, addApplicationListener, deleteApplicationListener,
   addExpectedApplicationClient, deleteExpectedApplicationClient,
-  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
-  saveFortigatePolicySnapshot, fortigatePolicyHistory
+  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate
 };

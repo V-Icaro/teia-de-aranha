@@ -114,8 +114,8 @@ function buildClient() {
     // Evita SniffingTransport tentando descobrir outros nós com cert inválido
     sniffOnStart: false,
     sniffOnConnectionFault: false,
-    maxRetries: 2,
-    requestTimeout: 120000 // janelas longas (24h) paginam bastante
+    maxRetries: Math.min(2, Math.max(0, Number.parseInt(process.env.ELASTIC_MAX_RETRIES || '1', 10) || 0)),
+    requestTimeout: Math.max(5000, Number.parseInt(process.env.ELASTIC_REQUEST_TIMEOUT_MS || '120000', 10) || 120000)
   };
   if (process.env.ELASTIC_API_KEY) {
     opts.auth = { apiKey: process.env.ELASTIC_API_KEY };
@@ -129,6 +129,75 @@ function buildClient() {
 }
 
 const client = buildClient();
+
+// Limita a pressão simultânea no cluster. Aggregations paginadas continuam
+// sequenciais por consulta; esta fila só controla concorrência entre rotas/jobs.
+const MAX_CONCURRENT_SEARCHES = Math.max(1, Number.parseInt(process.env.ELASTIC_MAX_CONCURRENT_SEARCHES || '3', 10) || 3);
+const MAX_QUEUED_SEARCHES = Math.max(1, Number.parseInt(process.env.ELASTIC_MAX_QUEUED_SEARCHES || '24', 10) || 24);
+const SEARCH_QUEUE_TIMEOUT_MS = Math.max(1000, Number.parseInt(process.env.ELASTIC_SEARCH_QUEUE_TIMEOUT_MS || '15000', 10) || 15000);
+const SLOW_SEARCH_WARN_MS = Math.max(1000, Number.parseInt(process.env.ELASTIC_SLOW_SEARCH_WARN_MS || '30000', 10) || 30000);
+const MAX_SPORT_BUCKETS = Math.max(100, Number.parseInt(process.env.MAX_SPORT_BUCKETS || '10000', 10) || 10000);
+let activeSearches = 0;
+const pendingSearches = [];
+
+function normalizeSearchError(error) {
+  const statusCode = Number(error?.statusCode ?? error?.meta?.statusCode ?? 0);
+  const transportFailure = statusCode === 0 && (
+    error?.name === 'ConnectionError' || error?.name === 'TimeoutError'
+    || ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(error?.code)
+    || String(error?.code || '').startsWith('ERR_TLS_')
+    || ['CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'].includes(error?.code)
+  );
+  if (!transportFailure) return error;
+  const reason = error.code || error.name || 'transport';
+  return Object.assign(new Error(`Elasticsearch indisponível ou timeout (${reason}).`), {
+    status: 503, code: 'ELASTIC_UNAVAILABLE', cause: error
+  });
+}
+
+function runSearchTask(task) {
+  if (task.timer) clearTimeout(task.timer);
+  activeSearches += 1;
+  const startedAt = Date.now();
+  Promise.resolve().then(() => client.search(task.params))
+    .then(task.resolve, (error) => task.reject(normalizeSearchError(error)))
+    .finally(() => {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= SLOW_SEARCH_WARN_MS) {
+      const aggregations = task.params.aggs || task.params.body?.aggs || {};
+      console.warn(`[elastic] busca lenta ${elapsed}ms index=${task.params.index || 'unknown'} aggs=${Object.keys(aggregations).join(',') || 'none'}`);
+    }
+    activeSearches -= 1;
+    const next = pendingSearches.shift();
+    if (next) runSearchTask(next);
+  });
+}
+
+function searchElastic(params) {
+  return new Promise((resolve, reject) => {
+    const task = { params, resolve, reject, timer: null };
+    if (activeSearches < MAX_CONCURRENT_SEARCHES) {
+      runSearchTask(task);
+      return;
+    }
+    if (pendingSearches.length >= MAX_QUEUED_SEARCHES) {
+      reject(Object.assign(new Error('Elasticsearch está ocupado; reduza o período ou tente novamente.'), { status: 503, code: 'ELASTIC_BUSY' }));
+      return;
+    }
+    task.timer = setTimeout(() => {
+      const index = pendingSearches.indexOf(task);
+      if (index < 0) return;
+      pendingSearches.splice(index, 1);
+      reject(Object.assign(new Error('A fila do Elasticsearch atingiu o tempo limite; tente novamente.'), { status: 503, code: 'ELASTIC_QUEUE_TIMEOUT' }));
+    }, SEARCH_QUEUE_TIMEOUT_MS);
+    task.timer.unref?.();
+    pendingSearches.push(task);
+  });
+}
+
+function elasticSearchStats() {
+  return { active: activeSearches, queued: pendingSearches.length, maxConcurrent: MAX_CONCURRENT_SEARCHES };
+}
 
 // Sessões vivas: agregação por PAR interno↔externo com flowEnd recente.
 // Não é "conexão aberta" (NetFlow não tem estado) — é "fluxo ainda ativo
@@ -148,7 +217,7 @@ async function fetchSessions(query, { activeSec = 120, maxPairs = 4000 } = {}) {
       if (after) {
         // `after_key` também aparece na última página do composite. Só uma
         // página de prova confirma que ainda havia pares depois do teto.
-        const probe = await client.search({
+        const probe = await searchElastic({
           index: ELASTIC_INDEX, size: 0, query: baseQuery,
           aggs: { pares: { composite: {
             size: 1, after,
@@ -171,7 +240,7 @@ async function fetchSessions(query, { activeSec = 120, maxPairs = 4000 } = {}) {
       ]
     };
     if (after) composite.after = after;
-    const resp = await client.search({
+    const resp = await searchElastic({
       index: ELASTIC_INDEX, size: 0, query: baseQuery,
       aggs: {
         pares: {
@@ -204,7 +273,7 @@ async function fetchSessions(query, { activeSec = 120, maxPairs = 4000 } = {}) {
 // normal) a média esconde o que aconteceu, e o operador precisa ver se foi
 // rajada, marcha-e-parou ou tráfego contínuo.
 async function fetchBeaconProfile({ src, dst, minutes = 240 }) {
-  const resp = await client.search({
+  const resp = await searchElastic({
     index: ELASTIC_INDEX,
     size: 2000,
     track_total_hits: true,
@@ -415,7 +484,7 @@ function addInventoryFlowFilter(target, ips, flowType = 'both') {
   }
 }
 
-async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = null, flowType = 'both', pagina = 5000, maxPaginas = 20 } = {}) {
+async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = null, flowType = 'both', pagina = 3000, maxPaginas = 12 } = {}) {
   const baseQuery = buildBaseQuery(query);
   addInventoryFlowFilter(baseQuery, inventoryIps, flowType);
 
@@ -434,7 +503,7 @@ async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = 
     };
     if (after) composite.after = after;
 
-    const r = await client.search({
+    const r = await searchElastic({
       index: ELASTIC_INDEX, size: 0, query: baseQuery,
       aggs: {
         pares: {
@@ -499,7 +568,13 @@ async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = 
     // última página também. O corte é a página vir cheia com o teto de páginas.
     paginas++;
     after = r.aggregations?.pares?.after_key || null;
-    if (after && paginas >= maxPaginas) truncadoES = true;
+    if (after && paginas >= maxPaginas) {
+      const probe = await searchElastic({
+        index: ELASTIC_INDEX, size: 0, query: baseQuery,
+        aggs: { pares: { composite: { size: 1, after, sources: composite.sources } } }
+      });
+      truncadoES = (probe.aggregations?.pares?.buckets || []).length > 0;
+    }
   } while (after && paginas < maxPaginas);
 
   // A subnet filtra em JS, com o MESMO cidrContains que o resto do backend usa.
@@ -563,7 +638,7 @@ async function detalharPares(query, pares, inventoryScope = {}) {
   // Antes eram 4 fontes no composite: ele ordena por CHAVE, não por bytes, então
   // o teto de buckets cortava as portas grandes e a linha saía sem porta nenhuma.
   // Aqui a cardinalidade é ~2x `pares`, então não há o que estourar.
-  const r = await client.search({
+  const r = await searchElastic({
     index: ELASTIC_INDEX, size: 0, query: q,
     aggs: {
       pares: {
@@ -604,14 +679,27 @@ async function detalharPares(query, pares, inventoryScope = {}) {
   }
 }
 
-async function fetchConnections(query, { pageSize, maxEdges = Infinity, ip = null, withSport = false, activeSec = null, withTimes = false }) {
+async function fetchConnections(query, { pageSize = 1000, maxEdges = 50000, ip = null, withSport = false, activeSec = null, withTimes = false }) {
+  const bucketLimit = withSport ? Math.min(maxEdges, MAX_SPORT_BUCKETS) : maxEdges;
   const afterPages = [];
   let after = undefined;
   let totalBuckets = 0;
+  let truncated = false;
+  const baseQuery = buildBaseQuery(query);
+  if (activeSec) baseQuery.bool.filter.push({ range: { [F_FEND]: { gte: `now-${activeSec}s` } } });
+  if (ip) {
+    baseQuery.bool.filter.push({
+      bool: {
+        should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }],
+        minimum_should_match: 1
+      }
+    });
+  }
 
-  while (true) {
+  while (totalBuckets < bucketLimit) {
+    const remaining = bucketLimit - totalBuckets;
     const composite = {
-      size: pageSize,
+      size: Math.min(pageSize, remaining),
       sources: [
         { origem: { terms: { field: F_SRC } } },
         { destino: { terms: { field: F_DST } } },
@@ -622,23 +710,6 @@ async function fetchConnections(query, { pageSize, maxEdges = Infinity, ip = nul
     if (withSport) composite.sources.push({ porta_orig: { terms: { field: F_SPORT, missing_bucket: true } } });
     if (after) composite.after = after;
 
-    const baseQuery = buildBaseQuery(query);
-    if (activeSec) {
-      // "Ativa" = teve pacote nos últimos N segundos (flowEnd recente).
-      // Cobre sessão aberta (active timeout reexporta) e recém-encerrada.
-baseQuery.bool.filter.push({ range: { [F_FEND]: { gte: `now-${activeSec}s` } } });
-    }
-    if (ip) {
-      baseQuery.bool.filter.push({
-        bool: {
-          should: [
-            { term: { [F_SRC]: ip } },
-            { term: { [F_DST]: ip } }
-          ],
-          minimum_should_match: 1
-        }
-      });
-    }
     const body = {
       size: 0,
       query: baseQuery,
@@ -660,7 +731,7 @@ baseQuery.bool.filter.push({ range: { [F_FEND]: { gte: `now-${activeSec}s` } } }
         }
     };
 
-    const resp = await client.search({ index: ELASTIC_INDEX, body });
+    const resp = await searchElastic({ index: ELASTIC_INDEX, body });
     const agg = resp.aggregations?.conexoes;
     if (!agg || !agg.buckets.length) break;
 
@@ -669,11 +740,27 @@ baseQuery.bool.filter.push({ range: { [F_FEND]: { gte: `now-${activeSec}s` } } }
 
     if (!agg.after_key) break;
     after = agg.after_key;
-    if (totalBuckets >= maxEdges) break;
   }
 
-  const out = afterPages.slice(0, maxEdges);
-  out.truncated = totalBuckets > out.length; // true só se algum teto cortou
+  if (after && totalBuckets >= bucketLimit) {
+    // O after_key pode existir também na última página. Uma página de prova
+    // confirma se havia mais buckets, sem percorrer o restante do composite.
+    const sources = [
+      { origem: { terms: { field: F_SRC } } },
+      { destino: { terms: { field: F_DST } } },
+      { protocolo: { terms: { field: F_PROTO, missing_bucket: true } } },
+      { porta_dest: { terms: { field: F_DPORT, missing_bucket: true } } }
+    ];
+    if (withSport) sources.push({ porta_orig: { terms: { field: F_SPORT, missing_bucket: true } } });
+    const probe = await searchElastic({
+      index: ELASTIC_INDEX, size: 0, query: baseQuery,
+      aggs: { conexoes: { composite: { size: 1, after, sources } } }
+    });
+    truncated = (probe.aggregations?.conexoes?.buckets || []).length > 0;
+  }
+
+  const out = afterPages.slice(0, bucketLimit);
+  out.truncated = truncated || totalBuckets > out.length;
   return out;
 }
 
@@ -698,12 +785,13 @@ function toCytoscape(buckets) {
       groups.set(k, g);
     }
     const bytes = b.bytes?.value || 0;
+    const flowCount = b.doc_count || 0;
     g.bytes += bytes;
     g.packets += b.pacotes?.value || 0;
-    g.flows += 1;
+    g.flows += flowCount;
     const dp = b.key.porta_dest ?? null;
     const cur = g.dports.get(dp) || { port: dp, bytes: 0, flows: 0 };
-    cur.bytes += bytes; cur.flows += 1;
+    cur.bytes += bytes; cur.flows += flowCount;
     g.dports.set(dp, cur);
     if (b.key.porta_orig != null && g.srcPorts.size < 50) g.srcPorts.add(b.key.porta_orig);
   }
@@ -748,6 +836,8 @@ function toCytoscape(buckets) {
 
 module.exports = {
   client,
+  searchElastic,
+  elasticSearchStats,
   ELASTIC_INDEX,
   F_SRC, F_DST, F_PROTO, F_SPORT, F_DPORT, F_FSTART, F_FEND, F_TCP_FLAGS, F_FLOW_DIRECTION, F_EXPORTER,
   TCP_SYN_NO_ACK_VALUES, TCP_SYN_ACK_VALUES, toMs, srcField,

@@ -15,7 +15,7 @@
 //      colheita, e um IP visto há 2h "nascia" com 24h
 //   3. dia sem documento no ES (expirou) é pulado, nunca virado em zero
 const { pool } = require('./db');
-const { client, ELASTIC_INDEX, F_SRC, F_DST } = require('./elastic');
+const { searchElastic, ELASTIC_INDEX, F_SRC, F_DST } = require('./elastic');
 const { checkIp, isPublicIp } = require('./reputation');
 const { localDay, addDays, dayRange } = require('./time');
 
@@ -52,8 +52,8 @@ async function harvestDia(dayIso, ateIso) {
     }
   });
   const [a, b] = await Promise.all([
-    client.search({ index: ELASTIC_INDEX, size: 0, query: q, aggs: { p: aggIP(F_SRC), _docs: { filter: { match_all: {} } } } }),
-    client.search({ index: ELASTIC_INDEX, size: 0, query: q, aggs: { p: aggIP(F_DST) } })
+    searchElastic({ index: ELASTIC_INDEX, size: 0, query: q, aggs: { p: aggIP(F_SRC), _docs: { filter: { match_all: {} } } } }),
+    searchElastic({ index: ELASTIC_INDEX, size: 0, query: q, aggs: { p: aggIP(F_DST) } })
   ]);
   // Sem documento no ES = dia que já expirou (ou sem tráfego). Não pode virar
   // "zero": isso apagaria o histórico já gravado.

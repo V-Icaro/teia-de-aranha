@@ -365,13 +365,6 @@ export const createFortigate = (body) => fortigateReq('', { method: 'POST', body
 export const updateFortigate = (id, body) => fortigateReq(`/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteFortigate = (id) => fortigateReq(`/${id}`, { method: 'DELETE' });
 export const testFortigate = (id) => fortigateReq(`/${id}/test`, { method: 'POST' });
-export const captureFortigateSnapshot = (id) => fortigateReq(`/${id}/snapshot`, { method: 'POST' });
-export const fetchFortigateHistory = (id, { days = 30, from, to, sort = 'bytes', limit = 100, offset = 0 } = {}) => {
-  const p = new URLSearchParams({ sort, limit: String(limit), offset: String(offset) });
-  if (from && to) { p.set('from', from); p.set('to', to); }
-  else p.set('days', String(days));
-  return fortigateReq(`/${id}/history?${p.toString()}`);
-};
 export const fetchFortigatePolicies = (id, { limit = 20, sort = 'hits', offset = 0, vdom = 'root' } = {}) =>
   fortigateReq(`/${id}/policies?limit=${limit}&sort=${encodeURIComponent(sort)}&offset=${offset}&vdom=${encodeURIComponent(vdom)}`);
 export const fetchFortigatePolicyDetail = (id, policyId, vdom) =>

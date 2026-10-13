@@ -1,6 +1,6 @@
 // Métricas por aplicação cadastrada: um fluxo conta quando seu IP/porta/protocolo
 // coincide com um listener em qualquer uma das interfaces da máquina.
-const { client, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_SPORT, F_DPORT, F_FSTART, F_FEND, buildTimeRange, knownServicePorts, protocolName, portName, cidrContains } = require('./elastic.js');
+const { searchElastic, ELASTIC_INDEX, F_SRC, F_DST, F_PROTO, F_SPORT, F_DPORT, F_FSTART, F_FEND, buildTimeRange, knownServicePorts, protocolName, portName, cidrContains } = require('./elastic.js');
 const { pool, listInventory, listSubnets } = require('./db.js');
 
 const F_OCTETS = 'netflow.octetDeltaCount';
@@ -47,7 +47,7 @@ async function topApplications(serverId, query, limit = 5) {
     outgoingFilters[key] = either(outgoing);
   }
 
-  const response = await client.search({
+  const response = await searchElastic({
     index: ELASTIC_INDEX,
     size: 0,
     query: { range: buildTimeRange(query) },
@@ -147,7 +147,7 @@ async function topKnownPorts(serverId, query, limit = 5) {
     bytes: { sum: { field: F_OCTETS } },
     packets: { sum: { field: F_PACKETS } }
   };
-  const response = await client.search({
+  const response = await searchElastic({
     index: ELASTIC_INDEX,
     size: 0,
     query: { range: buildTimeRange(query) },
@@ -335,7 +335,7 @@ async function bandwidthForServer(serverId, period = '1h', groupBy = 'server') {
       series.push({ key: group.key, label: group.label, rows });
     }
   } else if (groupBy === 'exporter' && serverIps.length) {
-    const response = await client.search({
+    const response = await searchElastic({
       index: ELASTIC_INDEX,
       size: 0,
       query: { bool: { filter: [
@@ -376,7 +376,7 @@ async function bandwidthForServer(serverId, period = '1h', groupBy = 'server') {
         { terms: { [F_DST]: group.ips } }
       ])
     ]));
-    const response = await client.search({
+    const response = await searchElastic({
       index: ELASTIC_INDEX,
       size: 0,
       query: { range: buildTimeRange({ minutes: settings.minutes }) },
@@ -424,7 +424,7 @@ function isoField(aggregation) {
   return aggregation?.value != null ? new Date(aggregation.value).toISOString() : null;
 }
 
-async function criticalServiceAccess(days = 30, { maxClients = 1000, maxPages = 50 } = {}) {
+async function criticalServiceAccess(days = 30, { maxClients = 1000, maxPages = 20 } = {}) {
   if (![30, 90, 365].includes(Number(days))) {
     throw Object.assign(new Error('Período deve ser 30, 90 ou 365 dias.'), { status: 400 });
   }
@@ -489,7 +489,7 @@ async function criticalServiceAccess(days = 30, { maxClients = 1000, maxPages = 
       ]
     };
     if (after) composite.after = after;
-    const response = await client.search({
+    const response = await searchElastic({
       index: ELASTIC_INDEX,
       size: 0,
       query: { bool: { filter: [
