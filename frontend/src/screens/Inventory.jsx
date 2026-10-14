@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 export default function InventoryScreen({
   closeInventory,
   inventoryData,
@@ -37,6 +39,8 @@ export default function InventoryScreen({
   removeInventoryListener,
   addInventoryListener
 }) {
+  const [expandedApplications, setExpandedApplications] = useState({});
+
   return (
     <main className="page-inventory">
       <div className="page-head inventory-page-head">
@@ -151,6 +155,7 @@ export default function InventoryScreen({
                       {!server.applications.length && <p className="hint">Nenhuma aplicação cadastrada.</p>}
                       {server.applications.map((application) => {
                         const appEditing = inventoryEdit?.kind === 'application' && inventoryEdit.id === application.id;
+                        const expanded = Boolean(expandedApplications[application.id]);
                         const listenerDraft = {
                           serverIpId: String(server.ips[0]?.id || ''), protocol: 'TCP', port: '',
                           ...(listenerDrafts[application.id] || {})
@@ -159,9 +164,20 @@ export default function InventoryScreen({
                         return (
                           <div className="inventory-application" key={application.id}>
                             <div className="inventory-application-head">
-                              {appEditing ? (
-                                <input autoFocus value={inventoryEdit.name} onChange={(e) => setInventoryEdit({ ...inventoryEdit, name: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && saveInventoryEdit()} />
-                              ) : <b>{application.name}</b>}
+                              <button
+                                type="button"
+                                className="inventory-application-toggle"
+                                aria-expanded={expanded}
+                                aria-controls={`inventory-application-${application.id}`}
+                                onClick={() => setExpandedApplications((current) => ({ ...current, [application.id]: !current[application.id] }))}
+                              >
+                                <span className="inventory-application-chevron" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                                <span className="inventory-application-summary">
+                                  <b>{application.name}</b>
+                                  <small>{application.listeners.length} listeners · {application.expectedClients?.length || 0} clientes esperados</small>
+                                </span>
+                              </button>
+                              {appEditing && <input autoFocus value={inventoryEdit.name} onChange={(e) => setInventoryEdit({ ...inventoryEdit, name: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && saveInventoryEdit()} />}
                               <div className="inventory-actions">
                                 {appEditing ? (
                                   <>
@@ -170,12 +186,13 @@ export default function InventoryScreen({
                                   </>
                                 ) : (
                                   <>
-                                    <button className="ghost" onClick={() => setInventoryEdit({ kind: 'application', id: application.id, name: application.name })}>Renomear</button>
+                                    <button className="ghost" onClick={() => { setExpandedApplications((current) => ({ ...current, [application.id]: true })); setInventoryEdit({ kind: 'application', id: application.id, name: application.name }); }}>Renomear</button>
                                     <button className="ghost" onClick={() => removeInventoryApplication(application)}>Remover</button>
                                   </>
                                 )}
                               </div>
                             </div>
+                            <div className="inventory-application-content" id={`inventory-application-${application.id}`} hidden={!expanded}>
                             <div className="inventory-expected-clients">
                               <div className="inventory-expected-head"><b>Clientes esperados</b><span className="hint">Allowlist usada no relatório de acessos críticos</span></div>
                               <div className="inventory-expected-list">
@@ -206,6 +223,7 @@ export default function InventoryScreen({
                               </select>
                               <input type="number" min="1" max="65535" value={listenerDraft.port} onChange={(e) => setListenerDraft(application.id, 'port', e.target.value)} placeholder="Porta" />
                               <button className="ghost" onClick={() => addInventoryListener(server, application)} disabled={!server.ips.length || inventoryBusy === `listener-new-${application.id}`}>Adicionar listener</button>
+                            </div>
                             </div>
                           </div>
                         );

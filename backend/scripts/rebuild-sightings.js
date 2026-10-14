@@ -15,9 +15,7 @@
 //      apagá-la gastaria cota do AbuseIPDB à toa)
 //   4. reprocessa dia a dia todos os dias que ainda existem no ES
 //   5. consulta país/reputação numa passada única, com guarda de cota
-//   6. refaz o backfill de pair_daily para os dias fechados, agora com
-//      flows = doc_count de verdade
-//   7. imprime a conferência: rollup bate com ip_daily? bytes plausíveis?
+//   6. imprime a conferência: rollup bate com ip_daily? bytes plausíveis?
 //
 // USO
 //   node scripts/rebuild-sightings.js            # só mostra o plano, não mexe
@@ -34,7 +32,6 @@ const { pool } = require('../src/db.js');
 const { init: dbInit } = require('../src/db.js');
 const { client, searchElastic, ELASTIC_INDEX } = require('../src/elastic.js');
 const { harvest, consultarPaises } = require('../src/regions.js');
-const { harvestDaily } = require('../src/daily.js');
 
 const CONFIRMAR = process.argv.includes('--confirm');
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, '..', '.backup');
@@ -50,21 +47,19 @@ async function tabelas() {
 }
 
 async function foto(tag) {
-  const [d, s, p, rep] = await Promise.all([
+  const [d, s, rep] = await Promise.all([
     pool.query(`select count(*)::int n, count(distinct ip)::int ips,
         coalesce(sum(bytes),0)::bigint bytes, min(day)::date de, max(day)::date ate
         from ip_daily`),
     pool.query(`select count(*)::int n, count(distinct ip)::int ips,
         coalesce(sum(bytes),0)::bigint bytes, min(first_seen) f, max(last_seen) l
         from ip_sightings`),
-    pool.query(`select count(*)::int n, count(distinct day)::int dias,
-        coalesce(sum(flows),0)::bigint flows from pair_daily`),
     pool.query('select count(*)::int n from ip_reputation')
   ]);
   const out = {
     tag,
     ip_daily: d.rows[0], ip_sightings: s.rows[0],
-    pair_daily: p.rows[0], ip_reputation: rep.rows[0].n
+    ip_reputation: rep.rows[0].n
   };
   return out;
 }
@@ -72,16 +67,15 @@ async function foto(tag) {
 async function mostrar(f) {
   log(`[${f.tag}] ip_daily     ${f.ip_daily.n} linhas / ${f.ip_daily.ips} IPs / ${f.ip_daily.bytes} bytes  (${f.ip_daily.de ? isoDay(f.ip_daily.de) : '-'} → ${f.ip_daily.ate ? isoDay(f.ip_daily.ate) : '-'})`);
   log(`[${f.tag}] ip_sightings  ${f.ip_sightings.n} linhas / ${f.ip_sightings.ips} IPs / ${f.ip_sightings.bytes} bytes  (${f.ip_sightings.f || '-'} → ${f.ip_sightings.l || '-'})`);
-  log(`[${f.tag}] pair_daily   ${f.pair_daily.n} linhas / ${f.pair_daily.dias} dias / flows=${f.pair_daily.flows}`);
   log(`[${f.tag}] ip_reputation ${f.ip_reputation} linhas (preservada)`);
 }
 
-// Dump de segurança: só das três tabelas que este script mexe.
+// Dump de segurança das tabelas reconstruídas.
 async function backup() {
   if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
   const arq = path.join(BACKUP_DIR, `sightings-${carimbo()}.sql`);
-  const partes = [`-- dump ${new Date().toISOString()} (ip_daily, ip_sightings, pair_daily)\n`];
-  for (const t of ['ip_daily', 'ip_sightings', 'pair_daily']) {
+  const partes = [`-- dump ${new Date().toISOString()} (ip_daily, ip_sightings)\n`];
+  for (const t of ['ip_daily', 'ip_sightings']) {
     // Não usar pg_get_tabledef: só existe no pg_dump, não no servidor.
     const dados = await pool.query(`select * from ${t}`);
     partes.push(`\n-- ==== ${t} (${dados.rows.length} linhas)\n`);
@@ -123,10 +117,8 @@ async function main() {
   await mostrar(antes);
 
   const dias = await diasNoES();
-  const fechados = dias.filter((d) => d < isoDay(new Date()));
   const corrente = dias.filter((d) => d === isoDay(new Date()));
   log('\nES tem', dias.length, 'dias:', `${dias[0]} → ${dias[dias.length - 1]}`);
-  log('  fechados (vão para ip_daily):', fechados.length);
   log('  dia corrente (cresce ao longo do dia, incluído):', corrente.join(', ') || '-');
 
   const seEspera = antes.ip_daily.de && isoDay(antes.ip_daily.de) < dias[0];
@@ -135,20 +127,14 @@ async function main() {
     log('       Bytes anteriores a isso não têm mais de onde vir — serão perdidos.');
   }
 
-  const faltandoFechados = fechados.filter((d) => {
-    const x = antes.pair_daily.n;
-    return x === 0 || true; // recalcula tudo mesmo; harvestDaily é idempotente
-  });
-
   if (!CONFIRMAR) {
     console.log('\n--- PLANO (nada foi escrito) ---');
     console.log(' 1. garantir schema ip_daily + índices');
-    console.log(' 2. backup de ip_daily, ip_sightings e pair_daily em', BACKUP_DIR);
+    console.log(' 2. backup de ip_daily e ip_sightings em', BACKUP_DIR);
     console.log(' 3. TRUNCATE ip_daily, ip_sightings   (ip_reputation fica)');
     console.log(` 4. reprocessar ${dias.length} dias do ES, um por transação, sem consultar AbuseIPDB`);
     console.log(' 5. passada única de país/reputação, parando se a cota acabar');
-    console.log(` 6. backfill de pair_daily para ${fechados.length} dias fechados (flows = doc_count)`);
-    console.log(' 7. conferência e relatório');
+    console.log(' 6. conferência e relatório');
     console.log('\nPara executar de fato:  node scripts/rebuild-sightings.js --confirm');
     await Promise.all([pool.end(), client.close()]);
     return;
@@ -193,13 +179,7 @@ async function main() {
     if (c.cotaEsgotada) log('  (os que faltarem ganham país no job das 06:15 dos próximos dias)');
   }
 
-  // 6. pair_daily: refaz só os fechados, agora com flows = doc_count.
-  log(`\nbackfill de pair_daily (${fechados.length} dias fechados)...`);
-  const hi = Date.now();
-  const pd = await harvestDaily(fechados);
-  log(`  ${pd.upserted} pares em ${((Date.now() - hi) / 1000).toFixed(0)}s`);
-
-  // 7. conferência
+  // 6. conferência
   log('\n=== CONFERÊNCIA ===');
   const depois = await foto('depois');
   await mostrar(depois);
@@ -218,10 +198,6 @@ async function main() {
   const dup = await pool.query(`select count(*)::int n from (
       select ip, day from ip_daily group by 1,2 having count(*) > 1) x`);
   log(`ip_daily com (ip, dia) duplicado: ${dup.rows[0].n}`);
-
-  const fluxos = await pool.query(`select count(*)::int n, coalesce(sum(flows),0)::bigint s
-      from pair_daily where flows <= 1`);
-  log(`pair_daily com flows <= 1: ${fluxos.rows[0].n} linhas (soma ${fluxos.rows[0].s})`);
 
   log('\nbackup em', arq);
   await Promise.all([pool.end(), client.close()]);

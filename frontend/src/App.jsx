@@ -5,7 +5,7 @@ import InventoryScreen from './screens/Inventory.jsx';
 import ReputationScreen from './screens/Reputation.jsx';
 import ExposureScreen from './screens/Exposure.jsx';
 import MapScreen from './screens/Map.jsx';
-import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRepOverview, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchDashboardPorts, fetchDashboardConversations, fetchDashboardBandwidth, fetchCriticalAccess, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
+import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
 
 const PRESETS = [
   { label: 'Últimos 5 min', minutes: 5 },
@@ -31,114 +31,6 @@ function fmtWindow(useCustom, custom, minutes) {
     return `personalizado (${f.toLocaleString('pt-BR')} → ${t.toLocaleString('pt-BR')}, ${horas}h)`;
   }
   return (PRESETS.find((p) => p.minutes === minutes) || { label: `Últimos ${minutes} min` }).label.toLowerCase();
-}
-
-function fmtRate(bitsPerSecond) {
-  if (bitsPerSecond >= 1e9) return `${(bitsPerSecond / 1e9).toFixed(2)} Gbps`;
-  if (bitsPerSecond >= 1e6) return `${(bitsPerSecond / 1e6).toFixed(2)} Mbps`;
-  if (bitsPerSecond >= 1e3) return `${(bitsPerSecond / 1e3).toFixed(1)} Kbps`;
-  return `${Math.round(bitsPerSecond || 0)} bps`;
-}
-
-function fmtAccessTime(value) {
-  if (!value) return '—';
-  const text = String(value);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return `${text.slice(8, 10)}/${text.slice(5, 7)}/${text.slice(0, 4)}`;
-  return fmtTime(text);
-}
-
-// Rampa de cor das faixas de score: verde (limpo) -> amber -> vermelho.
-// Passa por laranja e rosa porque o olho separa melhor degraus vizinhos do que
-// se fosse só verde/amarelo/vermelho.
-const SCORE_CORES = {
-  0: '#34d399',
-  '1-10': '#a3e635',
-  '11-30': '#fbbf24',
-  '31-50': '#fb923c',
-  '51-70': '#f87171',
-  '71-90': '#e879f9',
-  '91-100': '#ef4444',
-  'nao-verificado': '#5d6f8c'
-};
-const CTX_CORES = {
-  hospedagem: '#8b5cf6',
-  operadora: '#38bdf8',
-  institucional: '#34d399',
-  desconhecido: '#5d6f8c'
-};
-
-// Donut em SVG puro: sem dependência de gráfico (o bundle já roda em 666 kB e o
-// Vite já reclama). Cada fatia é um <circle> com stroke-dasharray; clicar numa
-// fatia filtra a lista da aba Base.
-function Donut({ dados, total, selecionado, onSelect, centroTitulo, centroSub }) {
-  const R = 54;
-  const C = 2 * Math.PI * R;
-  const fatias = dados.filter((d) => d.ips > 0);
-  // O anel segue a ordem de score (0 → 100, depois sem veredito): é a ordem que
-  // o AbuseIPDB usa e é ela que dá sentido à rampa de cor. A lista ao lado é
-  // ranking, então vai do maior para o menor — como qualquer lista de contagem.
-  const ranking = [...dados].sort((a, b) => b.ips - a.ips);
-  let offset = 0;
-  return (
-    <div className="donut-wrap">
-      <svg viewBox="0 0 160 160" width="160" height="160" role="img" aria-label="Distribuição por faixa de score">
-        <circle cx="80" cy="80" r={R} fill="none" stroke="var(--bg3)" strokeWidth="26" />
-        {fatias.map((d) => {
-          const frac = total ? d.ips / total : 0;
-          const len = frac * C;
-          const el = (
-            <circle key={d.key} cx="80" cy="80" r={R} fill="none"
-              stroke={SCORE_CORES[d.key] || 'var(--mut-dim)'} strokeWidth={selecionado && selecionado !== d.key ? 18 : 26}
-              strokeDasharray={`${len} ${C - len}`} strokeDashoffset={-offset}
-              transform="rotate(-90 80 80)" opacity={selecionado && selecionado !== d.key ? 0.35 : 1}
-              style={{ cursor: 'pointer', transition: 'opacity .15s, stroke-width .15s' }}
-              onClick={() => onSelect(selecionado === d.key ? null : d.key)}>
-              <title>{`${d.label}: ${d.ips} IP${d.ips > 1 ? 's' : ''} (${(frac * 100).toFixed(1)}%)`}</title>
-            </circle>
-          );
-          offset += len;
-          return el;
-        })}
-        <text x="80" y="76" textAnchor="middle" fill="var(--txt)" fontSize="22" fontWeight="700">{total}</text>
-        <text x="80" y="94" textAnchor="middle" fill="var(--mut)" fontSize="9">{centroTitulo}</text>
-        {centroSub && <text x="80" y="106" textAnchor="middle" fill="var(--mut-dim)" fontSize="8">{centroSub}</text>}
-      </svg>
-      <ul className="donut-legenda">
-        {ranking.map((d, i) => (
-          <li key={d.key} className={selecionado === d.key ? 'on' : ''} onClick={() => onSelect(selecionado === d.key ? null : d.key)}>
-            <em className="pos">{i + 1}</em>
-            <i style={{ background: SCORE_CORES[d.key] || 'var(--mut-dim)' }} />
-            <span>{d.label}</span>
-            <b>{d.ips}</b>
-            <em>{total ? `${((d.ips / total) * 100).toFixed(1)}%` : '0%'}</em>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-// Barra horizontal rotulada: uma linha por item, largura proporcional ao maior.
-function Barras({ itens, max, campoValor, campoRotulo, campoSecundario, onSelect, ativo }) {
-  if (!itens?.length) return <p className="hint">Sem dados no período.</p>;
-  const topo = max || Math.max(1, ...itens.map((i) => i[campoValor] || 0));
-  return (
-    <div className="barras">
-      {itens.map((i) => (
-        <div key={i[campoRotulo]} className={`barra-item${ativo === i[campoRotulo] ? ' on' : ''}`}
-          onClick={() => onSelect && onSelect(ativo === i[campoRotulo] ? null : i[campoRotulo])}>
-          <div className="talker-top">
-            <span className="talker-ip" style={{ fontSize: 12 }}>{i[campoRotulo]}</span>
-            <span className="talker-bytes">{i[campoSecundario]}</span>
-          </div>
-          <div className="bar">
-            <i style={{ width: `${Math.max(1.5, Math.round(((i[campoValor] || 0) / topo) * 100))}%`,
-              background: i.cor ? i.cor : undefined }} />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
 }
 
 function InventoryContext({ data }) {
@@ -543,28 +435,22 @@ const [perfMode, setPerfMode] = useState(false);
   const [cmpOpen, setCmpOpen] = useState(false);
   const [pairsOpen, setPairsOpen] = useState(false);
 
-  // Página "Reputação": painel + base + cobertura reunidos em uma tela para
-  // comparar contexto, vereditos e cobertura sem alternar entre janelas.
+  // Página "Reputação": base e cobertura do cache.
   const [repDbOpen, setRepDbOpen] = useState(false);
   const repReturnDashboardRef = useRef(true);
-  const [repTab, setRepTab] = useState('painel'); // painel | base | cobertura
-  const [repOv, setRepOv] = useState(null);
-  const [repOvLoading, setRepOvLoading] = useState(false);
-  const [repFaixa, setRepFaixa] = useState(null); // fatia do donut -> filtra a base
+  const [repTab, setRepTab] = useState('base'); // base | cobertura
   const [repDb, setRepDb] = useState(null);
   const [repDbLoading, setRepDbLoading] = useState(false);
   const [repHarvesting, setRepHarvesting] = useState(false);
   const [repHarvestMsg, setRepHarvestMsg] = useState(null);
-  const [repDbDays, setRepDbDays] = useState(7); // 1 | 7 | 30 | 0 (base inteira)
+  const [repDbDays, setRepDbDays] = useState(7); // janela máxima de 7 dias
   const [repDbOrder, setRepDbOrder] = useState('rep');
   const [repDbCountry, setRepDbCountry] = useState(null);
   const [repDbIp, setRepDbIp] = useState(null);
 
   const PERIODOS = [
     { v: 1, label: '24 horas' },
-    { v: 7, label: '7 dias' },
-    { v: 30, label: '30 dias' },
-    { v: 0, label: 'Base inteira' }
+    { v: 7, label: '7 dias' }
   ];
 
   async function loadRepDb(days = repDbDays, order = repDbOrder) {
@@ -581,36 +467,21 @@ const [perfMode, setPerfMode] = useState(false);
     }
   }
 
-  // Painel do período. Separado da base porque quem olha os gráficos não deve
-  // pagar a tabela de 3.400 IPs — e quem filtra por faixa não precisa recarregar.
-  async function loadRepOv(days = repDbDays) {
-    setRepOvLoading(true);
-    try {
-      setRepOv(await fetchRepOverview({ days }));
-    } catch {
-      setRepOv({ error: true });
-    } finally {
-      setRepOvLoading(false);
-    }
-  }
-
-  // Trocar o período mexe nos dois lados ao mesmo tempo: é o mesmo tempo, não dois.
+  // A tela de reputação limita a base à retenção disponível no ES.
   async function setPeriodo(days) {
     setRepDbDays(days);
     setRepDbCountry(null);
     setRepDbIp(null);
-    await Promise.all([loadRepOv(days), loadRepDb(days, repDbOrder)]);
+    await loadRepDb(days, repDbOrder);
   }
 
-  // Abre a página já com os três blocos pronos. A cobertura é consultada junto para
-  // o botão "verificar N IPs" saber o número sem o usuário precisar ir na aba.
-  function openRep(tab = 'painel') {
+  // Abre a base e carrega a cobertura para que o botão mostre quantos IPs faltam.
+  function openRep(tab = 'base') {
     setFortigateOpen(false);
     if (!repDbOpen) repReturnDashboardRef.current = dashboardOpen;
     setDashboardOpen(false);
     setRepDbOpen(true);
     setRepTab(tab);
-    loadRepOv(repDbDays);
     loadRepDb(repDbDays, repDbOrder);
     loadRepCoverage(publicIps);
   }
@@ -700,30 +571,13 @@ const [perfMode, setPerfMode] = useState(false);
     }
   }
 
-  // Só IPs com score > 0 (não confiáveis) primeiro; dentro de cada grupo, score
-  // e depois reports — a mesma ordem do backend, sem refazer a ordenação aqui.
+  // Lista os IPs de uma região com os vereditos mais problemáticos primeiro.
   function repDbIpsOf(country) {
-    let list = (repDb?.ips || []).filter((x) => (x.country || '??') === country);
-    if (repFaixa) list = list.filter((x) => faixaDe(x) === repFaixa);
+    const list = (repDb?.ips || []).filter((x) => (x.country || '??') === country);
     const rank = (v) => ({ malicious: 0, suspicious: 0, unknown: 1, clean: 2 }[v] ?? 1);
     return list.sort((a, b) => rank(a.verdict) - rank(b.verdict)
       || (b.score || 0) - (a.score || 0) || (b.reports || 0) - (a.reports || 0));
   }
-
-  // Mesma faixa do backend, para o filtro do donut casar com a lista.
-  function faixaDe(x) {
-    if (x.score == null) return 'nao-verificado';
-    if (x.score === 0) return '0';
-    if (x.score <= 10) return '1-10';
-    if (x.score <= 30) return '11-30';
-    if (x.score <= 50) return '31-50';
-    if (x.score <= 70) return '51-70';
-    if (x.score <= 90) return '71-90';
-    return '91-100';
-  }
-
-  // IPs visíveis na lista de base depois do filtro de faixa do donut.
-  const baseFiltrada = repFaixa ? (repDb?.ips || []).filter((x) => faixaDe(x) === repFaixa) : (repDb?.ips || []);
 
   const [pairsData, setPairsData] = useState(null);
   const [pairsLoading, setPairsLoading] = useState(false);
@@ -772,15 +626,6 @@ const [perfMode, setPerfMode] = useState(false);
   const [dashboardConversationsError, setDashboardConversationsError] = useState('');
   const [topTalkersForm, setTopTalkersForm] = useState({ top: '5', time: '1h', flowType: 'ingress' });
   const [topTalkersConfig, setTopTalkersConfig] = useState({ top: 5, time: '1h', flowType: 'ingress' });
-  const [bandwidthPeriod, setBandwidthPeriod] = useState('1h');
-  const [bandwidthGroup, setBandwidthGroup] = useState('server');
-  const [dashboardBandwidthData, setDashboardBandwidthData] = useState(null);
-  const [dashboardBandwidthLoading, setDashboardBandwidthLoading] = useState(false);
-  const [dashboardBandwidthError, setDashboardBandwidthError] = useState('');
-  const [criticalAccessDays, setCriticalAccessDays] = useState(30);
-  const [criticalAccessData, setCriticalAccessData] = useState(null);
-  const [criticalAccessLoading, setCriticalAccessLoading] = useState(false);
-  const [criticalAccessError, setCriticalAccessError] = useState('');
   const [dashboardRefresh, setDashboardRefresh] = useState(0);
 
   function pairsSubnetOptions() {
@@ -933,40 +778,6 @@ const [perfMode, setPerfMode] = useState(false);
       .finally(() => { if (!cancelled) setDashboardConversationsLoading(false); });
     return () => { cancelled = true; };
   }, [dashboardOpen, dashboardTab, inventoryLoading, topTalkersConfig.top, topTalkersConfig.time, topTalkersConfig.flowType, dashboardRefresh]);
-
-  useEffect(() => {
-    if (!dashboardOpen || dashboardTab !== 'bandwidth' || inventoryLoading || !dashboardServerId) {
-      setDashboardBandwidthData(null);
-      setDashboardBandwidthLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setDashboardBandwidthLoading(true);
-    setDashboardBandwidthError('');
-    setDashboardBandwidthData(null);
-    fetchDashboardBandwidth(dashboardServerId, bandwidthPeriod, bandwidthGroup)
-      .then((data) => { if (!cancelled) setDashboardBandwidthData(data); })
-      .catch((error) => { if (!cancelled) setDashboardBandwidthError(String(error.message || error)); })
-      .finally(() => { if (!cancelled) setDashboardBandwidthLoading(false); });
-    return () => { cancelled = true; };
-  }, [dashboardOpen, dashboardTab, inventoryLoading, dashboardServerId, bandwidthPeriod, bandwidthGroup, dashboardRefresh]);
-
-  useEffect(() => {
-    if (!dashboardOpen || dashboardTab !== 'criticalAccess' || inventoryLoading) {
-      setCriticalAccessData(null);
-      setCriticalAccessLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setCriticalAccessLoading(true);
-    setCriticalAccessError('');
-    setCriticalAccessData(null);
-    fetchCriticalAccess(criticalAccessDays)
-      .then((data) => { if (!cancelled) setCriticalAccessData(data); })
-      .catch((error) => { if (!cancelled) setCriticalAccessError(String(error.message || error)); })
-      .finally(() => { if (!cancelled) setCriticalAccessLoading(false); });
-    return () => { cancelled = true; };
-  }, [dashboardOpen, dashboardTab, inventoryLoading, criticalAccessDays, dashboardRefresh]);
 
   async function doInventoryAction(key, action) {
     setInventoryBusy(key);
@@ -1151,8 +962,6 @@ const [perfMode, setPerfMode] = useState(false);
                 <input value={lkIp} onChange={(e) => setLkIp(e.target.value)} placeholder="IP — ex. 42.251.129.234" onKeyDown={(e) => e.key === 'Enter' && runLookup(lkIp, lkDays)} />
                 <select value={lkDays} onChange={(e) => setLkDays(Number(e.target.value))} style={{ maxWidth: 110 }}>
                   <option value={7}>7 dias</option>
-                  <option value={14}>14 dias</option>
-                  <option value={30}>30 dias</option>
                 </select>
                 <button onClick={() => runLookup(lkIp, lkDays)} disabled={lkLoading}>{lkLoading ? '…' : 'Buscar'}</button>
               </div>
@@ -1218,7 +1027,12 @@ const [perfMode, setPerfMode] = useState(false);
   async function openIpModal(ip) {
     setIpModal({ loading: true, ip });
     try {
-      setIpModal(await fetchIpInfo(ip, timeParams()));
+      const details = await fetchIpInfo(ip, timeParams());
+      setIpModal(details);
+      if (isPublicIp(ip)) {
+        if (details.reputation) setRepMap((current) => ({ ...current, [ip]: details.reputation }));
+        await loadRepCoverage([ip]);
+      }
     } catch (e) {
       setIpModal({ ip, error: String(e.message || e) });
     }
@@ -1915,17 +1729,15 @@ cy.current.on('tap', (evt) => {
   const protos = [...new Set(graph.edges.map((e) => e.data.protocol))].sort();
   const selectedInventoryServer = inventoryData.find((server) => server.id === inventorySelectedId) || inventoryData[0] || null;
   const dashboardScreenProps = {
-    dashboardTab, closeDashboard, topTalkersConfig, bandwidthPeriod, criticalAccessDays,
+    dashboardTab, closeDashboard, topTalkersConfig,
     fmtWindow, useCustom, custom, minutes, loadInventory, setDashboardRefresh,
     inventoryLoading, dashboardLoading, dashboardPortsLoading, dashboardConversationsLoading,
-    dashboardBandwidthLoading, criticalAccessLoading, setDashboardTab, inventoryData,
+    setDashboardTab, inventoryData,
     inventoryError, openInventory, dashboardServerId, setDashboardServerId,
-    dashboardData, dashboardError, fmtBytes, dashboardPortsData, dashboardPortsError,
-    bandwidthGroup, setBandwidthGroup, setBandwidthPeriod, watchSubnets,
-    dashboardBandwidthData, dashboardBandwidthError, fmtRate,
-    criticalAccessData, criticalAccessError, setCriticalAccessDays, conversationEndpoint,
+    dashboardData, dashboardError, fetchApplicationConnections, fmtBytes, dashboardPortsData, dashboardPortsError,
+    conversationEndpoint,
     topTalkersForm, setTopTalkersForm, setTopTalkersConfig,
-    dashboardConversationsData, dashboardConversationsError, fmtAccessTime
+    dashboardConversationsData, dashboardConversationsError
   };
   const inventoryScreenProps = {
     closeInventory, inventoryData, loadInventory, inventoryLoading, inventoryError,
@@ -1940,11 +1752,10 @@ cy.current.on('tap', (evt) => {
     listenerDrafts, setListenerDraft, removeInventoryListener, addInventoryListener
   };
   const reputationScreenProps = {
-    closeRep, setRepHarvesting, setRepHarvestMsg, harvestRegions, loadRepDb, loadRepOv,
-    repDbLoading, repHarvesting, repHarvestMsg, repOvLoading, PERIODOS, repDbDays,
-    setPeriodo, repTab, setRepTab, repOv, fmtBytes, Donut, repFaixa, setRepFaixa,
-    setPgRep, setPgBase, setRepDbCountry, setRepDbIp, baseFiltrada, CTX_CORES,
-    Barras, publicIps, fmtWindow, useCustom, custom, minutes, checkRep, repLoading,
+    closeRep, setRepHarvesting, setRepHarvestMsg, harvestRegions, loadRepDb,
+    repDbLoading, repHarvesting, repHarvestMsg, PERIODOS, repDbDays,
+    setPeriodo, repTab, setRepTab, fmtBytes, setPgRep, setPgBase,
+    setRepDbCountry, setRepDbIp, publicIps, fmtWindow, useCustom, custom, minutes, checkRep, repLoading,
     pendingRep, repQuota, repMsg, sortedRepIps, pgRep, PAGE_REP, openIpModal,
     repMap, repBadge, repSource, pager, setRepDbOrder, repDbOrder, repDb,
     repDbIp, repDbCountry, repDbIpsOf, pgBase, VERDICTS, timeAgo, setLkIp,
@@ -2017,7 +1828,7 @@ cy.current.on('tap', (evt) => {
               <button className={`tool${pairsOpen ? ' active' : ''}`} onClick={() => { setPairsSubnet(''); setPairsOpen(true); loadPairs(); }} title="Top pares que mais conversam"><span className="ti" aria-hidden="true">⋈</span>Pares</button>
             </div>
             <div className="tool-group" aria-label="Segurança e exposição">
-              <button className={`tool${repDbOpen && !inventoryOpen ? ' active' : ''}${(repDb?.regions || []).some((r) => r.bad > 0) || (repOv?.kpis?.ruins || 0) > 0 ? ' danger' : ''}`} onClick={() => { setInventoryOpen(false); setRepDbIp(null); openRep('painel'); }} title="Reputação: painel com faixa de score e contexto, base de IPs e verificação de cache">
+              <button className={`tool${repDbOpen && !inventoryOpen ? ' active' : ''}${(repDb?.regions || []).some((r) => r.bad > 0) ? ' danger' : ''}`} onClick={() => { setInventoryOpen(false); setRepDbIp(null); openRep('base'); }} title="Reputação: base de IPs e verificação de cache">
                 <span className="ti" aria-hidden="true">◉</span>Reputação
               </button>
              <button className={`tool${expOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(false); setInventoryOpen(false); setExpOpen(true); loadExposure(); }} title="Exposição externa: risco por host, tráfego de entrada, destinos novos e sessões vivas">

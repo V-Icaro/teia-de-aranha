@@ -87,12 +87,8 @@ com mensagem explícita quando a fila fica cheia ou expira. Isso limita a
 concorrência entre mapa, Dashboard, Exposição e jobs; as páginas de um mesmo
 composite continuam sequenciais por `after_key`.
 
-O backfill diário usa páginas menores (`DAILY_COMPOSITE_PAGE_SIZE=5000`) e para
-em `DAILY_MAX_COMPOSITE_PAGES=40` (200 mil buckets por dia). Se o teto for
-atingido, o dia falha antes de apagar/substituir os dados existentes. A
-recuperação automática na inicialização tenta no máximo três dias por subida. O
-mapa tem teto próprio de 50 mil buckets por consulta; reduza a janela se aparecer
-o aviso de resultado parcial.
+O mapa tem teto próprio de 50 mil buckets por consulta; reduza a janela se
+aparecer o aviso de resultado parcial.
 
 ### 2.4. Grafo — `toCytoscape()` (`src/elastic.js`)
 
@@ -147,13 +143,6 @@ usados aqui, mas vale o registro).
 - Histórico: ThreatFox (passou a exigir chave, removido) e DNSBLs (Spamhaus não
   respondia no seu DNS; SpamCop/PSBL funcionavam) foram descartados a seu
   pedido. O código tem autoteste de zona documentado caso um dia volte.
-- `GET /api/reputation/overview?days=N` — agregado do painel (KPIs, faixas de
-  score, contexto de uso, países, ISPs, série diária e notas de retenção).
-  Consulta **só Postgres + `pair_daily`**, exceto os bytes de 24h, que vêm do ES
-  porque o `pair_daily` não tem dia corrente. Score aplicado é o de hoje; o corte
-  de contexto usa `usage_type` (`Data Center/Hosting/Transit/Content Delivery` →
-  hospedagem, `ISP` → operadora, `University/Education/Government/Commercial/
-  Corporate` → institucional).
 
 ### 2.7. Top talkers (`src/detect.js`, via `GET /api/alerts`)
 
@@ -171,12 +160,11 @@ janela, com in/out separados e nº de peers. É ranking, não alerta.
 | `POST /api/resolve` | `{ ips[] }` | `{ names, info{asn,org,prefix}, subnets }` |
 | `POST /api/reputation` | `{ ips[] }` (máx 100) | `{ rep: { ip: { verdict, sources, abuse } } }` |
 | `POST /api/reputation/coverage` | `{ ips[] }` (máx 300) | o que já está em cache + idade + estado da cota, **sem** chamar o AbuseIPDB |
-| `GET /api/reputation/db` | `days=0` (base toda) `order=rep\|reports\|bytes\|seen` | **base de reputação**: todos os IPs já verificados (`ip_reputation`) + histórico de conexões (`ip_sightings`), agrupados por país e ordenados por score |
-| `GET /api/reputation/overview` | `days=1\|7\|30\|0` | **painel de reputação**: KPIs, faixas de score, contexto de uso, países, ISPs, série diária e notas de retenção/fonte |
+| `GET /api/reputation/db` | `days=1\|7` `order=rep\|reports\|bytes\|seen` | **base de reputação** dos IPs observados nos últimos sete dias, agrupados por país |
 | `GET /api/ip/:ip` | tempo | **dossiê**: identidade + reputação + tráfego (top peers/portas, fluxos) |
 | `GET /api/compare?a=&b=` | tempo | A→B e B→A (bytes/fluxos), timeline (1/5/15 min auto), top portas por direção |
 | `GET /api/top-pairs` | tempo + `subnet?` | top 10 pares bidirecionais |
-| `GET /api/lookup?ip=&days=` | 7/14/30 | primeira/última vez, peers, portas, atividade diária |
+| `GET /api/lookup?ip=&days=` | até 7 | primeira/última vez, peers, portas, atividade diária |
 | `POST /api/stats/harvest` | `{hours}` | coleta manual do histórico (botão "⇅ coletar base" na tela de reputação) |
 | `GET /api/risk` | tempo + `only=all\|withbad\|clean` `limit` | **exposição a IP malicioso por host**: bytes que foram para score>0, ponderados pelo score |
 | `GET /api/inbound` | tempo + `limit` | fluxos IPv4 público→privado, incluindo protocolos sem porta |
@@ -202,11 +190,10 @@ Grafo: `PORT`, `MAX_EDGES` (trava opcional), `COMPOSITE_PAGE_SIZE`,
 `RDNS_CACHE_TTL_MS`, `RDNS_DNS_SERVERS`, `ASN_ENABLED`, `ASN_CACHE_TTL_MS`,
 `INVENTORY_FILE`. Top talkers: `ALERT_TOP_N`. Conexões ativas:
 `ACTIVE_WINDOW_SEC`. Reputação: `ABUSEIPDB_KEY`, `REP_CACHE_TTL_MS`,
-`REP_TIMEOUT_MS`, `REP_PG_TTL_DAYS`. Série diária: `DAILY_CRON` (padrão `40 6 * * *`,
-0 = desliga), `DAILY_MAX_DAYS`. Postgres: `PGHOST/PORT/USER/PASSWORD/DATABASE`
-ou `DATABASE_URL` (sub-redes, histórico de IPs, série diária, reputação).
+`REP_TIMEOUT_MS`, `REP_PG_TTL_DAYS`. Postgres: `PGHOST/PORT/USER/PASSWORD/DATABASE`
+ou `DATABASE_URL` (sub-redes, inventário, histórico de IPs e reputação).
 Fuso dos crons: `CRON_TZ`. Coleta de IPs públicos: `REGIONS_CRON`.
-Fuso dos "dias" dos relatórios: `REPORT_TZ` (padrão `America/Fortaleza`, ver 3.6b).
+Fuso dos dias locais do histórico de IPs: `REPORT_TZ` (padrão `America/Fortaleza`, ver 3.6).
 
 ---
 
@@ -267,39 +254,12 @@ duas listas do mesmo dado.
 
 ### 3.4. Reputação 🚨 — página inteira (painel, base, cobertura)
 
-Botão do topo que **trocou o mapa por uma página de largura toda** (a barra
-lateral, o grafo e o painel de detalhe saem de cena; o topbar fica, porque é
-de lá que se navega). "← mapa" no cabeçalho e `Esc` voltam. Virou página, e não
-modal, porque a leitura é comparativa — faixa × contexto × país × dia precisa de
-espaço lado a lado, não de uma caixa sobre o mapa.
+Botão do topo que abre uma página de largura toda. A tela mantém as abas Base e
+Cobertura; as consultas históricas ficam limitadas a **7 dias**, conforme a
+retenção de NetFlow no Elasticsearch.
 
-Uma tela com **um único seletor de período** (24h / 7d / 30d / base inteira)
-compartilhado pelas três abas, porque é o mesmo tempo nos dois lugares.
-
-**Painel** (`GET /api/reputation/overview?days=N`) — a resposta às três perguntas
-que o mapa não responde:
-
-- **KPIs:** IPs públicos vistos, quantos têm score > 0, que % do byte foi para
-  score > 0, cobertura (com veredito / sem veredito) e hosts internos que
-  falaram com IP público.
-- **Donut de score** em 8 faixas (0, 1-10, …, 91-100, sem veredito). O anel
-  segue a ordem de score (é a ordem do AbuseIPDB e a que dá sentido à rampa de
-  cor); a **lista ao lado é ranking**, do maior para o menor, como qualquer
-  contagem. Clicar numa fatia **filtra a aba Base** daquela faixa — o filtro
-  aparece no nome da aba e some com "limpar".
-- **Contexto de uso** (classificação `usage_type` do AbuseIPDB): hospedagem /
-  CDN / datacenter × operadora × institucional × sem classificação. É o corte que
-  separa varredura e cloud de saída para C2.
-- **Países e operadoras** com IP ruim (quem assina, não quem hospeda), do maior
-  para o menor.
-- **Bytes por dia** com dia fechado (`pair_daily`), barra empilhada: parte que foi
-  para score > 0 em cima do total, com o percentual ruim acima de cada coluna.
-- **Notas de honestidade:** de onde vieram os bytes, quantos dias fechados
-  entraram, retenção pedida × disponível e lacunas na série diária.
-
-**Base** (`GET /api/reputation/db?days=N&order=`) — o que já foi verificado no
-Postgres (`ip_reputation`), cruzado com o histórico (`ip_sightings`). Mesmo
-conteúdo de antes, agora dentro da tela única:
+**Base** (`GET /api/reputation/db?days=7&order=`) — IPs com reputação consultada,
+cruzados com as observações recentes:
 
 - **Por região:** países ordenados por nº de IPs problemáticos; clique abre a
   lista de IPs daquele país.
@@ -308,7 +268,7 @@ conteúdo de antes, agora dentro da tela única:
   por score na interface exigiria re-consultar a API externa e queimar cota).
 - **Por IP:** score, denúncias, bytes/fluxos acumulados, última denúncia,
   quando foi verificado, ISP/usage type/domínio.
-- **Ações:** dossiê completo, histórico de 7/30 dias (`/api/lookup`), localizar
+- **Ações:** dossiê completo, histórico de até 7 dias (`/api/lookup`), localizar
   no mapa.
 
 **Cobertura** — o que o cache local já sabe sobre os IPs públicos **visíveis no
@@ -316,14 +276,9 @@ mapa na janela atual**, com a idade de cada veredito e o estado da cota. O botã
 consulta **só o que não está em cache**; se a cota acabar, ele avisa e desliga em
 vez de insistir.
 
-⚠️ **O score é o de hoje, aplicado ao histórico.** Um IP visto há 30 dias aparece
-com o score que tem agora. Isso é barato (não exige guardar score por dia) e é
-aceitável para screening, mas não serve para provar o que o score era no momento
-do fluxo.
-
-⚠️ **`ip_sightings` é "IP público visto", não "origem maliciosa".** O coletor das
-06:15 grava o IP público tanto como origem quanto como destino do fluxo. Por isso
-"IPs públicos vistos" ≠ "quem acessou a rede".
+⚠️ **`ip_sightings` é "IP público visto", não "origem maliciosa".** A coleta grava
+o IP público tanto como origem quanto como destino do fluxo. Por isso "IPs
+públicos vistos" ≠ "quem acessou a rede".
 
 ### 3.4b. `ip_daily`: por que existe e como se recupera
 
@@ -336,8 +291,7 @@ direto em `ip_sightings` a cada coleta (`bytes = ip_sightings.bytes +
 excluded.bytes`). Só que o job das 06:15 usa janela de 24h e o botão de coleta
 manual usava 168h: as duas janelas cobriam os mesmos dias, o mesmo byte era
 somado de novo e a soma nunca voltava atrás. Medido antes da correção, os IPs de
-maior volume apareciam com **3,53× a 5,26×** os bytes que o ES realmente tinha
-(`pair_daily`, que nunca teve esse problema, era a referência).
+  maior volume apareciam com **3,53× a 5,26×** os bytes que o ES realmente tinha.
 
 Consequências do rollup:
 
@@ -354,9 +308,8 @@ Consequências do rollup:
 lá não tem de onde voltar — `ip_sightings` só cobre, no máximo, a partir do
 primeiro dia que ainda existe no ES. Reconstruir é `node
 backend/scripts/rebuild-sightings.js --confirm`, que zera `ip_daily` +
-`ip_sightings` (preservando `ip_reputation`, que é cache pago), reprocessa dia a
-dia o que o ES tem, e refaz o backfill de `pair_daily`. Sem `--confirm` ele só
-imprime o plano.
+  `ip_sightings` (preservando `ip_reputation`, que é cache pago) e reprocessa os
+  dias ainda presentes no ES. Sem `--confirm` ele só imprime o plano.
 
 ### 3.5. Exposição 🛡
 
@@ -402,77 +355,22 @@ risco(host) = Σ(bytes_para_ip × score/100) ÷ bytes_totais_externos
   uma aplicação a um IP, protocolo e porta. Os nomes cadastrados têm prioridade
   sobre o inventário JSON legado e rDNS no grafo e nos dossiês.
 
-### 3.6. Série diária da tela de Reputação (`backend/src/daily.js`)
+### 3.6. Fuso do dia local (`backend/src/time.js`)
 
-O ES guarda o fluxo bruto por pouco tempo. `pair_daily` guarda **bytes, pacotes e
-fluxos por dia, par e porta de destino**, e nunca expira. A tela de Reputação soma
-as portas; o relatório de acessos críticos usa `dport` para separar serviços.
-
-| Parte | O que faz |
-|---|---|
-| `pair_daily` | tabela `(day, src, dst, proto, dport)` + PK; `dport=0` significa porta ausente ou histórica ainda não reprocessada |
-| `harvestDaily()` | composite diário por origem/destino/protocolo/porta de destino → **apaga o dia e regrava** |
-
-Decisões da série:
-
-1. **Só dias fechados.** O job descarta o dia corrente porque ainda está
-   crescendo; a série histórica da Reputação usa dias completos.
-2. **Apagar-e-regravar, não somar.** Somar no `ON CONFLICT` pareceria natural,
-   mas rodar o job duas vezes — ou um backfill sobreposto — contaria o mesmo
-    byte duas vezes e distorceria os totais. Trocar o dia inteiro custa o
-   mesmo e dá o resultado certo sempre. É o que torna o job idempotente.
-3. **Só dias registrados entram na série.** Um dia sem linha pode significar
-   que não houve fluxo ou que a coleta não rodou; a tela de Reputação sinaliza
-    os dias disponíveis em vez de inventar um zero.
-
-O cron diário reprocessa `DAILY_REFRESH_DAYS` (padrão 3: os dois últimos dias
-fechados) para cobrir atraso curto do exporter, em vez de reler seis dias a cada
-execução. O limite de composite é `DAILY_COMPOSITE_PAGE_SIZE` ×
-`DAILY_MAX_COMPOSITE_PAGES` (padrão 200 mil buckets/dia); se exceder, a transação
-do dia não substitui os dados existentes.
-
-Depois da migração, reprocessar dias ainda retidos no ES para preencher `dport`:
-`cd backend && node scripts/backfill-pair-daily-ports.js 30 --confirm`.
-Histórico que já expirou no ES fica com porta desconhecida (`0`) e não pode ser
-reconstruído a partir da tabela antiga.
-
-### 3.6b. Fuso do "dia" dos relatórios (`backend/src/time.js`)
-
-O `day` de `pair_daily` e `ip_daily`, a janela de acessos críticos e a série da
-Reputação usam o **dia local** de `REPORT_TZ` (padrão `America/Fortaleza`), não o
-dia UTC. Em UTC-3 o dia UTC fecha às 21h locais: a virada dos relatórios caía no
-meio da noite e partia a janela de tráfego.
+O `day` de `ip_daily` usa o dia local de `REPORT_TZ` (padrão
+`America/Fortaleza`), não o dia UTC. Em UTC-3 o dia UTC fecha às 21h locais.
 
 `time.js` expõe `localDay(date)` (YYYY-MM-DD no fuso), `todayLocal()`,
 `dayRange(day)` (intervalo `[start, end)` do dia local como instantes UTC, com
 `start` = 00:00 local e `end` = 00:00 do dia seguinte, exclusivo) e `addDays(day, n)`.
-A coleta (`harvestDaily`, `harvestDia`) consulta o ES por esse intervalo
-(`gte`/`lt`) em vez de `T00:00:00Z`..`T23:59:59.999Z`; o `generate_series` da Banda
-em `7d`/`30d` e o `date_histogram` do dossiê `/api/ip` também passam a alinhar ao
-dia local (`time_zone`).
+A coleta de IPs consulta o ES por esse intervalo (`gte`/`lt`) em vez de
+`T00:00:00Z`..`T23:59:59.999Z`.
 
-**Migração:** as linhas já gravadas com dia UTC **não** são convertidas
-automaticamente. Só os dias novos (e os reprocessados por backfill) passam a usar
-o dia local, então pode haver um degrau de exibição entre o último dia UTC e o
-primeiro local. Reprocessar dias ainda retidos no ES usa os backfills existentes
-(`backfill-pair-daily-ports.js`, `rebuild-sightings.js`), ambos exigindo `--confirm`.
+**Migração:** linhas já gravadas com dia UTC não são convertidas automaticamente.
+Só os dias novos (e os reprocessados pelo `rebuild-sightings.js`) passam a usar o
+dia local.
 
-### 3.7. Acessos a serviços críticos
-
-`GET /api/dashboard/critical-access?days=30` lista clientes que chegaram às
-portas TCP 22, 445, 1433, 3389 e 5985 dos IPs inventariados. A primeira aparição
-vem do menor dia em `pair_daily`; fluxos do dia corrente vêm diretamente do ES.
-Um cliente só é marcado **fora do esperado** quando a aplicação tem uma allowlist
-configurada em `application_expected_clients`; sem allowlist aparece **sem baseline**.
-O `portHistoryStart` é o primeiro dia com `dport <> 0`, e `portHistoryDays` conta
-os dias que já têm porta confiável. `pairFirstDay` agrega origem/destino/protocolo
-ignorando porta, incluindo linhas antigas `dport=0`. `novelty` é `new` apenas quando
-o par e a porta aparecem depois do começo da cobertura; `known-pair-new-port` indica
-par anterior com porta nova; `baseline` significa que a primeira aparição coincide
-com ou precede o começo da cobertura. `isNew` permanece como compatibilidade e só
-é verdadeiro para `novelty=new`.
-
-### 3.8. Firewalls FortiGate (`backend/src/fortigate.js`)
+### 3.7. Firewalls FortiGate (`backend/src/fortigate.js`)
 
 A tela **FortiGate** no topo cadastra firewalls (nome + IP/host + token da API) e
 mostra as políticas com maior contagem de `hit_count`. Semana-semana:
@@ -509,7 +407,7 @@ contador atual está em zero, não que a política nunca tenha sido usada nem qu
 não teve uso num mês específico.
 
 
-### 3.9. Análise de políticas (`backend/src/firewallAnalysis.js`)
+### 3.8. Análise de políticas (`backend/src/firewallAnalysis.js`)
 
 A tela **FortiGate → Análise inteligente** não aplica nada no equipamento: só
 produz sugestões justificadas. O motor determinístico (sem IA generativa) cruza
@@ -543,30 +441,6 @@ severidade), `findings` e `limitations`. **É consultivo**: nada é aplicado no
 equipamento. Ainda não implementado (documentado no próprio endpoint): sombreamento/
 precedência fina entre regras, objetos de endereço/serviço órfãos e mudança anormal
 com snapshots históricos próprios.
-
-### 3.10. Banda (`backend/src/dashboard.js`, `bandwidthForServer`)
-
-A aba **Banda** do Dashboard mostra a série de bps de uma máquina, com
-agrupamento por máquina, sub-rede, aplicação ou exportador. Pontos do item 3:
-
-1. **Tempo pelo fim do fluxo.** O `date_histogram` usa
-   `netflow.flowEndMilliseconds` (`F_FEND`), não `@timestamp` (hora de
-   exportação, ~15s depois). O filtro ganha a margem `BANDWIDTH_TIME_MARGIN_MS`
-   (padrão 120000) para não cortar a primeira borda; o `hard_bounds` do
-   histograma corta os buckets da margem e o `extended_bounds` (com
-   `min_doc_count: 0`) continua preenchendo os intervalos vazios da janela.
-2. **P95 sobre 5 min.** Para `1h` os buckets de 1 min são agregados em amostras
-   de 5 min só para o P95; `6h`/`24h` já usam intervalos de 5 min. Em `7d`/`30d`
-   (fonte `pair_daily`, ponto diário) **não há P95** — a resposta devolve
-   `averageDailyBitsPerSecond` e `peakDailyBitsPerSecond`, e a tela mostra
-   "média diária" e "pico diário".
-3. **Duplicidade/direção.** A duplicação **não** é filtrada antes de medir:
-   `GET /api/diagnostics/duplication?minutes=5` pega os 20 pares com mais bytes
-   e quebra os bytes por exportador (`host.ip`) e por `flowDirection`. Se o
-   mesmo par aparece em vários exportadores ou em Ingress+Egress, os totais
-   somam o mesmo tráfego 2x. A consulta de banda aplica
-   `BANDWIDTH_FLOW_DIRECTION=both|ingress|egress` (padrão `both`), reaproveitando
-   `addInventoryFlowFilter`.
 
 ---
 

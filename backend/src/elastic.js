@@ -413,15 +413,31 @@ function serviceLabel(port, flows) {
 // Suporta: ?minutes=15 | ?range=now-15m | ?from=ISO&to=ISO
 function buildTimeRange(query) {
   if (query.from || query.to) {
-    const range = {};
-    if (query.from) range.gte = query.from;
-    if (query.to) range.lte = query.to;
-    return { '@timestamp': range };
+    const from = Date.parse(query.from || '');
+    const to = Date.parse(query.to || '');
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+      throw Object.assign(new Error('Informe um intervalo from/to válido.'), { status: 400 });
+    }
+    if (to - from > 7 * 24 * 60 * 60 * 1000) {
+      throw Object.assign(new Error('O histórico disponível é de até 7 dias.'), { status: 400 });
+    }
+    return { '@timestamp': { gte: query.from, lte: query.to } };
   }
   if (query.range) {
+    if (query.range !== 'now') {
+      const match = /^now-(\d+)([smhd])$/.exec(query.range);
+      if (!match) throw Object.assign(new Error('Use uma janela relativa de até 7 dias.'), { status: 400 });
+      const unitMs = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[match[2]];
+      if (Number(match[1]) * unitMs > 7 * 24 * 60 * 60 * 1000) {
+        throw Object.assign(new Error('O histórico disponível é de até 7 dias.'), { status: 400 });
+      }
+    }
     return { '@timestamp': { gte: query.range } };
   }
-  const minutes = parseInt(query.minutes || '15', 10) || 15;
+  const minutes = Number.parseInt(query.minutes || '15', 10);
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 7 * 24 * 60) {
+    throw Object.assign(new Error('O histórico disponível é de até 7 dias.'), { status: 400 });
+  }
   return { '@timestamp': { gte: `now-${minutes}m` } };
 }
 

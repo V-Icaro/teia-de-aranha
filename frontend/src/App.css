@@ -448,6 +448,13 @@ tr.clickable { cursor: pointer; }
 .inventory-server-head > div:first-child { display: flex; flex-direction: column; gap: 3px; }
 .inventory-server-head b, .inventory-application-head b { color: #e6edf7; font-size: 13px; }
 .inventory-server-head input, .inventory-application-head input { flex: 1; }
+.inventory-application-toggle { display: flex; min-width: 0; flex: 1; align-items: center; gap: 9px; padding: 3px 5px; border: 0; background: transparent; color: #e6edf7; box-shadow: none; text-align: left; }
+.inventory-application-toggle:hover:not(:disabled) { border: 0; background: #1b2839; box-shadow: none; }
+.inventory-application-chevron { width: 14px; flex: 0 0 14px; color: #92a7c1; font-size: 16px; text-align: center; }
+.inventory-application-summary { display: grid; min-width: 0; gap: 2px; }
+.inventory-application-summary b { overflow-wrap: anywhere; }
+.inventory-application-summary small { color: #98a9be; font-size: 10px; font-weight: 450; }
+.inventory-application-content[hidden] { display: none; }
 .inventory-ip-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .inventory-ip, .inventory-listener { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 7px; border: 1px solid #314259; border-radius: 8px; background: #1a2738; }
 .inventory-ip button, .inventory-listener button { padding: 1px 6px; border: 0; background: transparent; color: #91a1b6; box-shadow: none; }
@@ -750,6 +757,9 @@ tr.subrow td { background: #f5f7f7; }
 .pager button { border-color: #cbd1d2; background: #fff; color: #4d575b; }
 .inventory-server { border-color: #dce1e2; border-radius: 4px; background: #f7f8f8; }
 .inventory-server-head b, .inventory-application-head b { color: #30383b; }
+.inventory-application-toggle { color: #30383b; }
+.inventory-application-toggle:hover:not(:disabled) { background: #f1f3f3; }
+.inventory-application-chevron, .inventory-application-summary small { color: #697478; }
 .inventory-ip, .inventory-listener { border-color: #d5dadb; border-radius: 4px; background: #fff; color: #4f595d; }
 .inventory-ip button, .inventory-listener button { color: #697478; }
 .inventory-ip button:hover:not(:disabled), .inventory-listener button:hover:not(:disabled) { background: #fceeee; color: #b73c43; }
@@ -832,27 +842,13 @@ tr.subrow td { background: #f5f7f7; }
 .dashboard-ports-table th:nth-child(5) { width: 26%; }
 .dashboard-period-select { display: grid; min-width: 110px; gap: 3px; color: #596367; font-size: 10px; font-weight: 650; }
 .dashboard-period-select select { height: 31px; padding: 5px 8px; }
-.dashboard-bandwidth-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 9px; }
-.dashboard-bandwidth-kpis { grid-template-columns: repeat(4,minmax(0,1fr)); }
-.bandwidth-chart-wrap { display: grid; grid-template-columns: 65px minmax(0,1fr); gap: 9px; padding: 12px 12px 24px; border: 1px solid #dce1e2; border-radius: 4px; background: #fff; }
-.bandwidth-y-axis { display: flex; flex-direction: column; justify-content: space-between; padding: 3px 0 1px; color: #737e82; font-size: 9px; text-align: right; }
-.bandwidth-plot { display: flex; min-width: 0; height: 230px; align-items: stretch; gap: 2px; padding: 7px 2px 20px; border-bottom: 1px solid #cdd3d4; background: repeating-linear-gradient(to bottom,transparent 0,transparent 24%,#e9edee 24.5%,transparent 25%); }
-.bandwidth-time-group { position: relative; display: flex; min-width: 2px; flex: 1; align-items: flex-end; justify-content: center; }
-.bandwidth-series-bars { display: flex; width: 100%; height: 100%; align-items: flex-end; justify-content: center; gap: 1px; }
-.bandwidth-series-bars > i { display: block; min-width: 1px; max-width: 12px; flex: 1; border-radius: 2px 2px 0 0; }
-.bandwidth-time-group > small { position: absolute; bottom: -19px; left: 50%; transform: translateX(-50%); color: #707a7e; font-size: 8px; white-space: nowrap; }
-.bandwidth-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; color: #596367; font-size: 10px; }
-.bandwidth-legend span { display: inline-flex; align-items: center; gap: 5px; }
-.bandwidth-legend i { width: 8px; height: 8px; border-radius: 2px; }
-.dashboard-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding-bottom: 10px; border-bottom: 1px solid #e4e7e8; }
-.dashboard-critical-access-table { min-width: 1180px; }
-.dashboard-critical-access-table th:first-child { width: 16%; }
-.dashboard-critical-access-table th:nth-child(2), .dashboard-critical-access-table th:nth-child(3) { width: 15%; }
-.dashboard-critical-access-table th:nth-child(4) { width: 17%; }
-.dashboard-critical-access-table th:nth-child(5), .dashboard-critical-access-table th:nth-child(6) { width: 10%; }
-.dashboard-critical-access-table th:nth-child(7) { width: 7%; }
-.dashboard-critical-access-table th:nth-child(8) { width: 10%; }
-.critical-access-status { display: flex; flex-wrap: wrap; gap: 4px; }
+.dashboard-application-link { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; color: var(--acc); font-size: inherit; font-weight: 650; text-align: left; }
+.dashboard-application-link:hover:not(:disabled) { border: 0; background: transparent; box-shadow: none; text-decoration: underline; }
+.dashboard-application-connections { width: min(1180px, 96vw); }
+.dashboard-application-connections-table { min-width: 1180px; table-layout: auto; }
+.dashboard-application-connections-table th:nth-last-child(-n+2),
+.dashboard-application-connections-table td:nth-last-child(-n+2) { min-width: 160px; white-space: nowrap; }
+.dashboard-application-connections-pager { justify-content: flex-end; gap: 10px; }
 
 html { scrollbar-color: #c2c9cb #f1f2f3; }
 ::-webkit-scrollbar-thumb { background: #c2c9cb; background-clip: padding-box; }
@@ -877,9 +873,6 @@ html { scrollbar-color: #c2c9cb #f1f2f3; }
   .dashboard-grid { gap: 10px; }
   .dashboard-conversation-form { display: grid; grid-template-columns: 1fr 1fr; }
   .dashboard-conversation-form button { width: 100%; }
-  .dashboard-bandwidth-kpis { grid-template-columns: repeat(2,minmax(0,1fr)); }
-  .bandwidth-chart-wrap { grid-template-columns: 49px minmax(0,1fr); gap: 5px; padding-right: 7px; padding-left: 7px; }
-  .bandwidth-plot { height: 190px; gap: 1px; }
 }
 
 .layout.inventory-page { grid-template-columns: minmax(0,1fr); grid-template-rows: auto minmax(0,1fr); }

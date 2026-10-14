@@ -1,5 +1,4 @@
-// Fuso de relatório: o "dia" das séries diárias (pair_daily, ip_daily, acessos
-// críticos, série da Reputação) é o dia LOCAL, não o dia UTC.
+// Fuso de relatório: o "dia" do histórico diário de IPs é o dia LOCAL, não o UTC.
 //
 // Motivo: em Fortaleza (UTC-3) um dia fechado em UTC termina às 21h locais, ou
 // seja, a virada dos relatórios caía no meio da noite e partia a janela de

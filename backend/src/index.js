@@ -4,7 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { client, searchElastic, elasticSearchStats, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
 const { hostRisk, inboundFlows, newExternalPeers, isPrivate, windowStart } = require('./risk');
-const { topApplications, topKnownPorts, bandwidthForServer, criticalServiceAccess } = require('./dashboard');
+const { topApplications, applicationConnections, topKnownPorts } = require('./dashboard');
 const { subnetOf, resolveMany, resolveIp } = require('./names');
 const { topTalkers } = require('./detect');
 const { checkMany, checkIp, isPublicIp, listReputationDb, coverageFor, quotaState, repTtlDays } = require('./reputation');
@@ -22,7 +22,6 @@ const { analyzePolicies } = require('./firewallAnalysis.js');
 const cron = require('node-cron');
 
 dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
-const DAILY_REFRESH_DAYS = Math.min(7, Math.max(2, Number.parseInt(process.env.DAILY_REFRESH_DAYS || '3', 10) || 3));
 
 // A feature "Vigilância de hosts" foi removida: cadastrar host para vigiar,
 // aprender peers e gerar achados rendeu 1.126 itens não acionados em 30 dias.
@@ -42,23 +41,6 @@ if ((process.env.REGIONS_CRON || '15 6 * * *') !== '0') {
     }
   }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
   console.log(`[regions] agendado: ${process.env.REGIONS_CRON || '15 6 * * *'}`);
-}
-
-// Série diária por par (pair_daily): alimenta o gráfico histórico da tela de
-// Reputação. Roda depois da colheita de regiões e mantém o histórico após o ES expirar.
-if ((process.env.DAILY_CRON || '40 6 * * *') !== '0') {
-  cron.schedule(process.env.DAILY_CRON || '40 6 * * *', async () => {
-    try {
-      const ok = await dbInit();
-      if (!ok) return;
-      const { harvestDaily, MAX_DAYS } = require('./daily.js');
-      const r = await harvestDaily(DAILY_REFRESH_DAYS);
-      console.log(`[daily] série diária: ${r.upserted} pares em ${r.days} dias fechados (sobreposição ${DAILY_REFRESH_DAYS - 1}d; janela máx ${MAX_DAYS})`);
-    } catch (e) {
-      console.error(`[daily] falha na série diária: ${e.message}`);
-    }
-  }, { timezone: process.env.CRON_TZ || 'America/Sao_Paulo' });
-  console.log(`[daily] agendado: ${process.env.DAILY_CRON || '40 6 * * *'}`);
 }
 
 const app = express();
@@ -108,11 +90,26 @@ app.get('/api/dashboard/applications', async (req, res) => {
     const serverId = inventoryId(req.query.serverId);
     if (!serverId) return res.status(400).json({ error: 'Informe um serverId válido.' });
     const window = windowOf(req.query);
-    const result = await topApplications(serverId, req.query, 5);
+    const result = await topApplications(serverId, req.query);
     res.json({ window, ...result });
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar aplicações do dashboard', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/dashboard/applications/:applicationId/connections', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const serverId = inventoryId(req.query.serverId);
+    const applicationId = inventoryId(req.params.applicationId);
+    if (!serverId || !applicationId) return res.status(400).json({ error: 'Informe serverId e applicationId válidos.' });
+    const window = windowOf(req.query);
+    const result = await applicationConnections(serverId, applicationId, req.query);
+    res.json({ window, ...result });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar conexões da aplicação', detail: String(e.message || e) });
   }
 });
 
@@ -174,32 +171,6 @@ app.get('/api/dashboard/conversations', async (req, res) => {
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar conversas do inventário', detail: String(e.message || e) });
-  }
-});
-
-app.get('/api/dashboard/bandwidth', async (req, res) => {
-  try {
-    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const serverId = inventoryId(req.query.serverId);
-    if (!serverId) return res.status(400).json({ error: 'Informe um serverId válido.' });
-    const period = String(req.query.period || '1h');
-    const groupBy = String(req.query.groupBy || 'server');
-    res.json(await bandwidthForServer(serverId, period, groupBy));
-  } catch (e) {
-    if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar série de banda', detail: String(e.message || e) });
-  }
-});
-
-app.get('/api/dashboard/critical-access', async (req, res) => {
-  try {
-    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const days = intParam(req.query.days, { nome: 'days', def: 30, min: 30, max: 365 });
-    if (![30, 90, 365].includes(days)) return res.status(400).json({ error: 'days deve ser 30, 90 ou 365.' });
-    res.json(await criticalServiceAccess(days));
-  } catch (e) {
-    if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao carregar acessos críticos', detail: String(e.message || e) });
   }
 });
 
@@ -1122,7 +1093,7 @@ app.get('/api/lookup', async (req, res) => {
   try {
     const ip = (req.query.ip || '').trim();
     if (!ip) return res.status(400).json({ error: 'Envie ?ip=IP' });
-    const days = intParam(req.query.days, { nome: 'days', def: 7, min: 1, max: 90 });
+    const days = intParam(req.query.days, { nome: 'days', def: 7, min: 1, max: 7 });
     const base = [
       { range: { '@timestamp': { gte: `now-${days}d` } } },
       { bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 } }
@@ -1171,30 +1142,15 @@ app.get('/api/lookup', async (req, res) => {
   }
 });
 
-// Base de reputação do Postgres: IPs já verificados + histórico de conexões,
-// agrupados por região. ?days=0 (tudo) &order=rep|reports|bytes|seen|country
+// Base de reputação: IPs observados no período de até sete dias, agrupados por região.
 app.get('/api/reputation/db', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    res.json(await listReputationDb({ days: req.query.days, order: req.query.order, limit: req.query.limit }));
+    const days = intParam(req.query.days, { nome: 'days', def: 7, min: 1, max: 7 });
+    res.json(await listReputationDb({ days, order: req.query.order, limit: req.query.limit }));
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: 'Falha na base de reputação', detail: String(e.message || e) });
-  }
-});
-
-// Painel consolidado da tela "Reputação": KPIs, faixas de score, contexto de
-// uso, top país/ISP e série por dia. Leitura pura do Postgres (+ ES só quando a
-// janela é de 24h, para incluir o dia corrente) — não gasta cota do AbuseIPDB.
-// ?days=0 (base inteira)
-app.get('/api/reputation/overview', async (req, res) => {
-  try {
-    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const { overviewFor } = require('./reputation.js');
-    res.json(await overviewFor({ days: req.query.days }));
-  } catch (e) {
-    if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: 'Falha no painel de reputação', detail: String(e.message || e) });
   }
 });
 
@@ -1206,7 +1162,7 @@ app.post('/api/stats/harvest', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
     const { harvest } = require('./regions.js');
-    const hours = intParam(req.body?.hours, { nome: 'hours', def: 24, min: 1, max: 24 * 30 });
+    const hours = intParam(req.body?.hours, { nome: 'hours', def: 24, min: 1, max: 24 * 7 });
     res.json(await harvest(hours));
   } catch (e) {
     if (!e.status) console.error(e);
@@ -1215,27 +1171,3 @@ app.post('/api/stats/harvest', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Backend rodando em http://localhost:${PORT} (indice ${ELASTIC_INDEX})`));
-
-// Recuperação da série diária usada no gráfico da tela de Reputação. O job das
-// 06:40 só roda se o processo estiver no ar naquele minuto; na subida, regravamos
-// os dias fechados que faltam. harvestDaily() apaga e regrava o dia idempotentemente.
-//
-// Fica DEPOIS do app.listen de propósito: a primeira requisição do usuário não
-// espera a releitura pesada do Elasticsearch.
-if ((process.env.DAILY_CRON || '40 6 * * *') !== '0' && process.env.DAILY_BACKFILL !== '0') {
-  setTimeout(async () => {
-    try {
-      if (!(await dbInit())) return;
-      const { harvestDaily, missingDays } = require('./daily.js');
-      // Recupera poucos dias por subida para não concentrar um backfill grande
-      // no instante em que o backend e o Elasticsearch estão aquecendo.
-      const faltando = await missingDays({ max: 3 });
-      if (!faltando.length) return;
-      console.log(`[daily] ${faltando.length} dia(s) sem serie: ${faltando.join(', ')} - recuperando`);
-      const r = await harvestDaily(faltando);
-      console.log(`[daily] recuperacao concluida: ${r.upserted} pares em ${r.days} dias`);
-    } catch (e) {
-      console.error(`[daily] falha na recuperacao da serie: ${e.message}`);
-    }
-  }, 5000);
-}

@@ -1,9 +1,11 @@
+import { useEffect, useRef, useState } from 'react';
+
+const APPLICATIONS_PER_PAGE = 5;
+
 export default function DashboardScreen({
   dashboardTab,
   closeDashboard,
   topTalkersConfig,
-  bandwidthPeriod,
-  criticalAccessDays,
   fmtWindow,
   useCustom,
   custom,
@@ -14,8 +16,6 @@ export default function DashboardScreen({
   dashboardLoading,
   dashboardPortsLoading,
   dashboardConversationsLoading,
-  dashboardBandwidthLoading,
-  criticalAccessLoading,
   setDashboardTab,
   inventoryData,
   inventoryError,
@@ -24,27 +24,73 @@ export default function DashboardScreen({
   setDashboardServerId,
   dashboardData,
   dashboardError,
+  fetchApplicationConnections,
   fmtBytes,
   dashboardPortsData,
   dashboardPortsError,
-  bandwidthGroup,
-  setBandwidthGroup,
-  setBandwidthPeriod,
-  watchSubnets,
-  dashboardBandwidthData,
-  dashboardBandwidthError,
-  fmtRate,
-  criticalAccessData,
-  criticalAccessError,
-  setCriticalAccessDays,
   conversationEndpoint,
   topTalkersForm,
   setTopTalkersForm,
   setTopTalkersConfig,
   dashboardConversationsData,
-  dashboardConversationsError,
-  fmtAccessTime
+  dashboardConversationsError
 }) {
+  const [applicationConnectionsDialog, setApplicationConnectionsDialog] = useState(null);
+  const [applicationConnectionsPage, setApplicationConnectionsPage] = useState(0);
+  const applicationConnectionsRequest = useRef(0);
+  const applicationConnections = applicationConnectionsDialog?.data?.connections || [];
+  const applicationConnectionsPages = Math.ceil(applicationConnections.length / APPLICATIONS_PER_PAGE);
+  const currentApplicationConnectionsPage = Math.min(applicationConnectionsPage, Math.max(0, applicationConnectionsPages - 1));
+  const visibleApplicationConnections = applicationConnections.slice(
+    currentApplicationConnectionsPage * APPLICATIONS_PER_PAGE,
+    (currentApplicationConnectionsPage + 1) * APPLICATIONS_PER_PAGE
+  );
+  const [applicationsPage, setApplicationsPage] = useState(0);
+  const applications = dashboardData?.applications || [];
+  const applicationsPages = Math.ceil(applications.length / APPLICATIONS_PER_PAGE);
+  const currentApplicationsPage = Math.min(applicationsPage, Math.max(0, applicationsPages - 1));
+  const visibleApplications = applications.slice(
+    currentApplicationsPage * APPLICATIONS_PER_PAGE,
+    (currentApplicationsPage + 1) * APPLICATIONS_PER_PAGE
+  );
+  const maxApplicationFlows = Math.max(1, ...applications.map((application) => application.flows));
+
+  useEffect(() => {
+    setApplicationsPage(0);
+  }, [dashboardData]);
+
+  async function loadApplicationConnections(application) {
+    const requestId = applicationConnectionsRequest.current + 1;
+    applicationConnectionsRequest.current = requestId;
+    setApplicationConnectionsDialog({ application, loading: true, data: null, error: '' });
+    const query = useCustom && custom.from && custom.to
+      ? { from: new Date(custom.from).toISOString(), to: new Date(custom.to).toISOString() }
+      : { minutes };
+    try {
+      const data = await fetchApplicationConnections(dashboardServerId, application.id, query);
+      if (applicationConnectionsRequest.current === requestId) {
+        setApplicationConnectionsDialog({ application, loading: false, data, error: '' });
+      }
+    } catch (error) {
+      if (applicationConnectionsRequest.current === requestId) {
+        setApplicationConnectionsDialog({ application, loading: false, data: null, error: String(error.message || error) });
+      }
+    }
+  }
+
+  function openApplicationConnections(application) {
+    setApplicationConnectionsPage(0);
+    loadApplicationConnections(application);
+  }
+
+  function closeApplicationConnections() {
+    applicationConnectionsRequest.current += 1;
+    setApplicationConnectionsDialog(null);
+    setApplicationConnectionsPage(0);
+  }
+
+  const formatConnectionTime = (value) => value ? new Date(value).toLocaleString('pt-BR') : '—';
+
   return (
     <main className="page-dashboard">
       <div className="page-head">
@@ -53,21 +99,19 @@ export default function DashboardScreen({
           <div><h2>Dashboard</h2><span className="hint">visão de tráfego por máquina</span></div>
         </div>
         <div className="page-actions">
-          <span className="badge low">{dashboardTab === 'topTalkers' ? topTalkersConfig.time : dashboardTab === 'bandwidth' ? bandwidthPeriod : dashboardTab === 'criticalAccess' ? `${criticalAccessDays}d` : fmtWindow(useCustom, custom, minutes)}</span>
-          <button className="ghost" onClick={() => { loadInventory(); setDashboardRefresh((n) => n + 1); }} disabled={inventoryLoading || dashboardLoading || dashboardPortsLoading || dashboardConversationsLoading || dashboardBandwidthLoading || criticalAccessLoading} title="Atualizar inventário e dados">↻</button>
+          <span className="badge low">{dashboardTab === 'topTalkers' ? topTalkersConfig.time : fmtWindow(useCustom, custom, minutes)}</span>
+          <button className="ghost" onClick={() => { loadInventory(); setDashboardRefresh((n) => n + 1); }} disabled={inventoryLoading || dashboardLoading || dashboardPortsLoading || dashboardConversationsLoading} title="Atualizar inventário e dados">↻</button>
         </div>
       </div>
       <div className="page-bar dashboard-page-bar">
         <div className="seg dashboard-tabs">
           <button className={dashboardTab === 'applications' ? 'active' : ''} onClick={() => setDashboardTab('applications')}>Aplicações</button>
           <button className={dashboardTab === 'ports' ? 'active' : ''} onClick={() => setDashboardTab('ports')}>Portas</button>
-          <button className={dashboardTab === 'bandwidth' ? 'active' : ''} onClick={() => setDashboardTab('bandwidth')}>Banda</button>
-          <button className={dashboardTab === 'criticalAccess' ? 'active' : ''} onClick={() => setDashboardTab('criticalAccess')}>Acessos críticos</button>
           <button className={dashboardTab === 'topTalkers' ? 'active' : ''} onClick={() => setDashboardTab('topTalkers')}>Tráfego</button>
         </div>
-        <span className="hint">{dashboardTab === 'applications' ? 'Ranking por fluxos NetFlow · volume em bytes' : dashboardTab === 'ports' ? 'Ranking por fluxos em portas conhecidas de aplicações' : dashboardTab === 'bandwidth' ? 'Série temporal e capacidade da máquina' : dashboardTab === 'criticalAccess' ? 'Clientes de serviços críticos das máquinas do inventário' : 'Conversas que envolvem IPs do inventário'}</span>
+        <span className="hint">{dashboardTab === 'applications' ? 'Ranking por fluxos NetFlow · volume em bytes' : dashboardTab === 'ports' ? 'Ranking por fluxos em portas conhecidas de aplicações' : 'Conversas que envolvem IPs do inventário'}</span>
       </div>
-      <div className={`dashboard-grid${['topTalkers','criticalAccess'].includes(dashboardTab) ? ' dashboard-wide-grid' : ''}`}>
+      <div className={`dashboard-grid${dashboardTab === 'topTalkers' ? ' dashboard-wide-grid' : ''}`}>
         <aside className="dashboard-machines">
           <div className="dashboard-section-head">
             <h3>Máquinas</h3>
@@ -108,7 +152,7 @@ export default function DashboardScreen({
                   </div>
                   <span className="badge low">{dashboardData.applicationsWithTraffic} de {dashboardData.totalApplications} com tráfego</span>
                 </div>
-                <p className="hint">Top 5 por registros NetFlow que coincidem com IP, protocolo e porta do listener. Um fluxo NetFlow não representa necessariamente uma requisição de aplicação.</p>
+               <p className="hint">Aplicações ordenadas por registros NetFlow que coincidem com IP, protocolo e porta do listener. A lista é exibida de cinco em cinco; um fluxo NetFlow não representa necessariamente uma requisição de aplicação.</p>
                 {!dashboardData.applications.length ? (
                   <div className="empty">Esta máquina ainda não tem aplicações cadastradas.<br /><button className="ghost" onClick={openInventory} style={{ marginTop: 10 }}>Cadastrar aplicações</button></div>
                 ) : dashboardData.applications[0].flows === 0 ? (
@@ -118,12 +162,11 @@ export default function DashboardScreen({
                   <table className="dashboard-data-table" aria-label="Aplicações mais acessadas">
                     <thead><tr><th>Aplicação</th><th>Tráfego</th><th>Utilização</th><th>Entrada / saída</th><th>Listeners</th></tr></thead>
                     <tbody>
-                      {dashboardData.applications.map((application, index) => {
-                        const maxFlows = Math.max(1, ...dashboardData.applications.map((app) => app.flows));
-                        const utilization = Math.round((application.flows / maxFlows) * 100);
+                      {visibleApplications.map((application, index) => {
+                        const utilization = Math.round((application.flows / maxApplicationFlows) * 100);
                         return (
                           <tr key={application.id}>
-                            <td><span className="dashboard-rank">{index + 1}</span><b className="dashboard-row-name">{application.name}</b></td>
+                            <td><span className="dashboard-rank">{currentApplicationsPage * APPLICATIONS_PER_PAGE + index + 1}</span><button type="button" className="linklike dashboard-application-link" onClick={() => openApplicationConnections(application)} title="Ver conexões que correspondem aos listeners desta aplicação">{application.name}</button></td>
                             <td><b>{application.flows} fluxos</b><small>{fmtBytes(application.bytes)}</small></td>
                             <td><div className="dashboard-utilization"><div className="bar"><i style={{ width: `${Math.max(application.flows ? 2 : 0, utilization)}%` }} /></div><span>{utilization}%</span></div></td>
                             <td><span className="dashboard-direction">↓ {fmtBytes(application.incoming.bytes)} <i>·</i> ↑ {fmtBytes(application.outgoing.bytes)}</span></td>
@@ -134,6 +177,12 @@ export default function DashboardScreen({
                     </tbody>
                   </table>
                 </div>
+                {applicationsPages > 1 && <div className="pager dashboard-applications-pager" aria-label="Paginação das aplicações">
+                  <span>{currentApplicationsPage * APPLICATIONS_PER_PAGE + 1}–{Math.min((currentApplicationsPage + 1) * APPLICATIONS_PER_PAGE, applications.length)} de {applications.length}</span>
+                  <button className="ghost" disabled={currentApplicationsPage === 0} onClick={() => setApplicationsPage(currentApplicationsPage - 1)}>Anterior</button>
+                  <span>{currentApplicationsPage + 1} / {applicationsPages}</span>
+                  <button className="ghost" disabled={currentApplicationsPage >= applicationsPages - 1} onClick={() => setApplicationsPage(currentApplicationsPage + 1)}>Próxima</button>
+                </div>}
               </>
             )}
           </section>
@@ -179,108 +228,6 @@ export default function DashboardScreen({
               </>
             )}
           </section>
-        ) : dashboardTab === 'bandwidth' ? (
-          <section className="dashboard-applications dashboard-bandwidth">
-            {!dashboardServerId ? (
-              <div className="empty">Selecione uma máquina cadastrada para ver sua banda.</div>
-            ) : dashboardBandwidthLoading ? (
-              <p className="hint">Agregando tráfego ao longo do tempo…</p>
-            ) : dashboardBandwidthError ? (
-              <p className="error">Falha ao carregar a série de banda: {dashboardBandwidthError}</p>
-            ) : !dashboardBandwidthData ? (
-              <p className="hint">Aguardando série de banda…</p>
-            ) : (
-              <>
-                <div className="dashboard-section-head bandwidth-heading">
-                  <div>
-                    <h3>{dashboardBandwidthData.server.name}</h3>
-                    <span className="hint">{dashboardBandwidthData.server.ips.map((item) => item.ip).join(' · ')} · {dashboardBandwidthData.groupBy === 'application' ? 'por aplicação' : dashboardBandwidthData.groupBy === 'exporter' ? 'por exporter' : dashboardBandwidthData.groupBy === 'subnet' ? 'por sub-rede (IPs inventariados)' : 'por máquina'} · fonte {dashboardBandwidthData.source === 'pair_daily' ? 'pair_daily' : 'NetFlow em tempo real'}</span>
-                  </div>
-                  <div className="dashboard-bandwidth-controls">
-                    <label className="dashboard-period-select"><span>Agrupar por</span><select value={bandwidthGroup} onChange={(event) => setBandwidthGroup(event.target.value)}>
-                      <option value="server">Máquina</option><option value="subnet" disabled={!watchSubnets?.length}>Sub-rede</option>
-                      <option value="application" disabled={!inventoryData.find((item) => item.id === dashboardServerId)?.applications.length || ['7d','30d'].includes(bandwidthPeriod)}>Aplicação</option>
-                      <option value="exporter" disabled={['7d','30d'].includes(bandwidthPeriod)}>Exporter</option>
-                    </select></label>
-                    <label className="dashboard-period-select"><span>Período</span><select value={bandwidthPeriod} onChange={(event) => {
-                      const period = event.target.value;
-                      setBandwidthPeriod(period);
-                      if (['7d','30d'].includes(period) && ['application','exporter'].includes(bandwidthGroup)) setBandwidthGroup('server');
-                    }}><option value="1h">1h</option><option value="6h">6h</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option></select></label>
-                  </div>
-                </div>
-                <div className="kpis dashboard-bandwidth-kpis">
-                  <div><b>{fmtBytes(dashboardBandwidthData.summary.totalBytes)}</b><span>volume total</span></div>
-                  <div><b>{fmtRate(dashboardBandwidthData.summary.averageBitsPerSecond)}</b><span>média</span></div>
-                  <div><b>{fmtRate(dashboardBandwidthData.summary.peakBitsPerSecond)}</b><span>pico</span></div>
-                  <div><b>{fmtRate(dashboardBandwidthData.summary.p95BitsPerSecond)}</b><span>percentil 95</span></div>
-                </div>
-                {!dashboardBandwidthData.series.length || dashboardBandwidthData.summary.totalFlows === 0 ? (
-                  <div className="empty">Sem fluxos para este agrupamento no período.</div>
-                ) : (() => {
-                  const series = dashboardBandwidthData.series;
-                  const buckets = series[0]?.buckets || [];
-                  const maxRate = Math.max(1, ...series.flatMap((line) => line.buckets.map((bucket) => bucket.bitsPerSecond)));
-                  const labelStep = Math.max(1, Math.ceil(buckets.length / 8));
-                  const seriesColors = ['#21b875', '#3478c8', '#8b65ba', '#ec8b32', '#1a9e9b'];
-                  return (
-                    <>
-                      <div className="bandwidth-chart-wrap">
-                        <div className="bandwidth-y-axis"><span>{fmtRate(maxRate)}</span><span>{fmtRate(maxRate / 2)}</span><span>0</span></div>
-                        <div className="bandwidth-plot" role="img" aria-label={`Banda de ${dashboardBandwidthData.server.name} ao longo de ${bandwidthPeriod}`}>
-                          {buckets.map((bucket, index) => {
-                            const time = new Date(bucket.time);
-                            const label = bandwidthPeriod.endsWith('d')
-                              ? time.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })
-                              : time.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-                            return (
-                              <div className="bandwidth-time-group" key={bucket.time}>
-                                <div className="bandwidth-series-bars">{series.map((line, lineIndex) => {
-                                  const point = line.buckets[index] || { bitsPerSecond: 0, bytes: 0 };
-                                  const height = Math.round((point.bitsPerSecond / maxRate) * 100);
-                                  return <i key={line.key} title={`${line.label} · ${fmtRate(point.bitsPerSecond)} · ${fmtBytes(point.bytes)}`} style={{ height: `${point.bitsPerSecond ? Math.max(2, height) : 0}%`, background: seriesColors[lineIndex % seriesColors.length] }} />;
-                                })}</div>
-                                {index % labelStep === 0 && <small>{label}</small>}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                      {series.length > 1 && <div className="bandwidth-legend">{series.map((line, index) => <span key={line.key}><i style={{ background: seriesColors[index % seriesColors.length] }} />{line.label}</span>)}</div>}
-                    </>
-                  );
-                })()}
-                <p className="hint">Banda estimada por bucket: bytes NetFlow × 8 ÷ duração do intervalo. P95 é calculado sobre os pontos da série. O vDS pode exportar o mesmo tráfego em mais de um ponto; valide interfaces e direção antes de usar os totais para cobrança.</p>
-              </>
-            )}
-          </section>
-        ) : dashboardTab === 'criticalAccess' ? (
-          <section className="dashboard-applications dashboard-critical-access">
-            <div className="dashboard-section-head">
-              <div><h3>Quem acessa serviços críticos</h3><span className="hint">TCP 22, 445, 1433, 3389 e 5985 · histórico diário mais fluxos recentes</span></div>
-              <label className="dashboard-period-select"><span>Período</span><select value={criticalAccessDays} onChange={(event) => setCriticalAccessDays(Number(event.target.value))}><option value={30}>30 dias</option><option value={90}>90 dias</option><option value={365}>365 dias</option></select></label>
-            </div>
-            {criticalAccessLoading ? <p className="hint">Consultando acessos às portas críticas…</p>
-              : criticalAccessError ? <p className="error">Falha ao carregar acessos críticos: {criticalAccessError}</p>
-                : !criticalAccessData ? <p className="hint">Aguardando consulta de acessos…</p>
-                  : criticalAccessData.inventoryIps === 0 ? <div className="empty">Nenhum IP cadastrado no inventário.</div>
-                    : !criticalAccessData.clients.length ? <div className="empty">Nenhum acesso a essas portas no período selecionado.</div>
-                      : <>
-                        <div className="dashboard-summary"><span className="badge low">{criticalAccessData.clients.length} acessos · {criticalAccessData.days} dias</span><span className="hint">“Novo” indica primeira aparição no período. “Fora do esperado” depende da allowlist cadastrada na aplicação; sem allowlist o estado fica sem baseline.</span></div>
-                        {criticalAccessData.truncated && <p className="error">A consulta excedeu o limite de páginas; a lista pode estar incompleta.</p>}
-                        <div className="table-wrap dashboard-table-wrap"><table className="dashboard-data-table dashboard-critical-access-table" aria-label="Clientes que acessaram serviços críticos do inventário">
-                          <thead><tr><th>Serviço</th><th>Servidor</th><th>Cliente</th><th>Classificação</th><th>Primeiro acesso</th><th>Último acesso</th><th>Fluxos</th><th>Bytes</th></tr></thead>
-                          <tbody>{criticalAccessData.clients.map((access) => (
-                            <tr key={`${access.source}|${access.target}|${access.protocol}|${access.port}`}>
-                              <td><b>{access.service} · {access.port}</b><small>{access.applications.join(' · ') || access.protocol}</small></td>
-                              <td>{conversationEndpoint(access.target)}</td><td>{conversationEndpoint(access.source)}</td>
-                              <td><div className="critical-access-status">{access.isNew && <span className="badge med">Novo</span>}{access.expectedStatus === 'expected' && <span className="badge low">Esperado</span>}{access.expectedStatus === 'unexpected' && <span className="badge high">Fora do esperado</span>}{access.expectedStatus === 'unconfigured' && <span className="badge med">Sem baseline</span>}</div></td>
-                              <td>{fmtAccessTime(access.firstSeen)}</td><td>{fmtAccessTime(access.lastSeen)}</td><td>{access.flows}</td><td>{fmtBytes(access.bytes)}</td>
-                            </tr>
-                          ))}</tbody>
-                        </table></div>
-                      </>}
-          </section>
         ) : (
           <section className="dashboard-applications dashboard-conversations">
             <form className="dashboard-conversation-form" onSubmit={(event) => {
@@ -315,6 +262,39 @@ export default function DashboardScreen({
           </section>
         )}
       </div>
+      {applicationConnectionsDialog && <div className="modal-backdrop" onClick={closeApplicationConnections}>
+        <div className="modal modal-wide dashboard-application-connections" role="dialog" aria-modal="true" aria-labelledby="application-connections-title" onClick={(event) => event.stopPropagation()}>
+          <div className="modal-head">
+            <div><h2 id="application-connections-title">Conexões · {applicationConnectionsDialog.application.name}</h2><span className="hint">Fluxos que correspondem aos listeners cadastrados · {fmtWindow(useCustom, custom, minutes)}</span></div>
+            <div className="page-actions"><button className="ghost" onClick={() => loadApplicationConnections(applicationConnectionsDialog.application)} disabled={applicationConnectionsDialog.loading} title="Atualizar conexões">↻</button><button className="ghost" onClick={closeApplicationConnections} aria-label="Fechar conexões">✕</button></div>
+          </div>
+          <div className="modal-body">
+            <p className="hint">Listeners: {applicationConnectionsDialog.application.listeners.map((listener) => `${listener.ip} · ${listener.protocol}/${listener.port}`).join(' · ') || 'nenhum cadastrado'}</p>
+            {applicationConnectionsDialog.loading && <p className="hint">Consultando conexões no NetFlow…</p>}
+            {applicationConnectionsDialog.error && <p className="error">Falha ao consultar conexões: {applicationConnectionsDialog.error}</p>}
+            {!applicationConnectionsDialog.loading && !applicationConnectionsDialog.error && applicationConnectionsDialog.data && (
+              applicationConnections.length ? <>
+                {applicationConnectionsDialog.data.truncated && <p className="error">A agregação atingiu o limite de 10.000 IPs por direção; a lista pode estar incompleta.</p>}
+                <div className="table-wrap"><table className="dashboard-data-table dashboard-application-connections-table">
+                  <thead><tr><th>IP remoto único</th><th>Direção</th><th>Protocolos</th><th>Fluxos</th><th>Pacotes</th><th>Bytes</th><th>Primeiro fluxo</th><th>Último fluxo</th></tr></thead>
+                  <tbody>{visibleApplicationConnections.map((connection) => <tr key={connection.ip}>
+                    <td className="mono">{conversationEndpoint(connection.ip)}</td>
+                    <td>{connection.direction}</td>
+                    <td>{connection.protocols.join(' · ') || '—'}</td><td>{connection.flows}</td><td>{connection.packets}</td><td>{fmtBytes(connection.bytes)}</td>
+                    <td>{formatConnectionTime(connection.firstSeen)}</td><td>{formatConnectionTime(connection.lastSeen)}</td>
+                  </tr>)}</tbody>
+                </table></div>
+                <div className="pager dashboard-application-connections-pager" aria-label="Paginação das conexões">
+                  <span>{currentApplicationConnectionsPage * APPLICATIONS_PER_PAGE + 1}–{Math.min((currentApplicationConnectionsPage + 1) * APPLICATIONS_PER_PAGE, applicationConnections.length)} de {applicationConnections.length} IPs</span>
+                  <button className="ghost" onClick={() => setApplicationConnectionsPage((page) => Math.max(0, page - 1))} disabled={currentApplicationConnectionsPage === 0}>Anterior</button>
+                  <span>Página {currentApplicationConnectionsPage + 1} / {applicationConnectionsPages}</span>
+                  <button className="ghost" onClick={() => setApplicationConnectionsPage((page) => Math.min(applicationConnectionsPages - 1, page + 1))} disabled={currentApplicationConnectionsPage >= applicationConnectionsPages - 1}>Próxima</button>
+                </div>
+              </> : <p className="empty">Nenhum fluxo correspondente aos listeners desta aplicação no período.</p>
+            )}
+          </div>
+        </div>
+      </div>}
     </main>
   );
 }

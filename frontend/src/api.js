@@ -125,22 +125,11 @@ export async function fetchRepCoverage(ips) {
 }
 
 // Base de reputação do Postgres (tudo já verificado) + histórico de conexões
-export async function fetchReputationDb({ days = 0, order = 'rep' } = {}) {
+export async function fetchReputationDb({ days = 7, order = 'rep' } = {}) {
   const p = new URLSearchParams({ days: String(days), order });
   const r = await fetch(`/api/reputation/db?${p.toString()}`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json(); // { days, order, total, regions[], ips[] }
-}
-
-// Painel consolidado da tela "Reputação": KPIs, faixas de score, contexto de
-// uso, top país/ISP e série por dia. Leitura da base — não gasta cota.
-export async function fetchRepOverview({ days = 7 } = {}) {
-  const p = new URLSearchParams({ days: String(days) });
-  const r = await fetch(`/api/reputation/overview?${p.toString()}`);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-  // { days, desde, ate, kpis{}, bytes{}, buckets[], contexts[], paises[], isps[],
-  //   serie[], retencao{}, notas[] }
 }
 
 // ------------------------------------------------------------------ risco
@@ -314,6 +303,15 @@ export async function fetchDashboardApplications(serverId, { minutes, from, to }
   return r.json();
 }
 
+export async function fetchApplicationConnections(serverId, applicationId, { minutes, from, to } = {}) {
+  const p = new URLSearchParams({ serverId: String(serverId) });
+  if (from && to) { p.set('from', from); p.set('to', to); }
+  else p.set('minutes', String(minutes));
+  const r = await fetch(`/api/dashboard/applications/${applicationId}/connections?${p.toString()}`);
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
+  return r.json();
+}
+
 // Top 5 portas conhecidas que correspondem a tráfego nos IPs da máquina.
 export async function fetchDashboardPorts(serverId, { minutes, from, to } = {}) {
   const p = new URLSearchParams({ serverId: String(serverId) });
@@ -327,22 +325,6 @@ export async function fetchDashboardPorts(serverId, { minutes, from, to } = {}) 
 export async function fetchDashboardConversations({ top = 5, time = '1h', flowType = 'ingress' } = {}) {
   const p = new URLSearchParams({ top: String(top), time, flowType });
   const r = await fetch(`/api/dashboard/conversations?${p.toString()}`);
-  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
-  return r.json();
-}
-
-export async function fetchDashboardBandwidth(serverId, period = '1h', groupBy = 'server') {
-  const p = new URLSearchParams({ serverId: String(serverId), period, groupBy });
-  const r = await fetch(`/api/dashboard/bandwidth?${p.toString()}`);
-  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
-  return r.json();
-}
-
-
-
-export async function fetchCriticalAccess(days = 30) {
-  const p = new URLSearchParams({ days: String(days) });
-  const r = await fetch(`/api/dashboard/critical-access?${p.toString()}`);
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
   return r.json();
 }

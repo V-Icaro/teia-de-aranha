@@ -2,7 +2,7 @@
 // Tabelas criadas sozinhas na primeira conexão (init).
 // Postgres guarda sub-redes, inventário manual e históricos usados pelo mapa/
 // Reputação: watched_subnets, servers/server_ips/applications/listeners,
-// ip_sightings, pair_daily e ip_reputation.
+// ip_sightings e ip_reputation.
 const { Pool } = require('pg');
 const { encrypt, decrypt } = require('./crypto.js');
 
@@ -65,45 +65,6 @@ async function init() {
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS idx_sightings_last ON ip_sightings (last_seen DESC);
-        -- Série diária por par e porta de destino. dport=0 representa fluxos
-        -- sem porta e linhas antigas até que sejam reprocessadas do Elasticsearch.
-        CREATE TABLE IF NOT EXISTS pair_daily (
-          day DATE NOT NULL,
-          src TEXT NOT NULL,
-          dst TEXT NOT NULL,
-          proto INT,
-          dport INT NOT NULL DEFAULT 0,
-          bytes BIGINT NOT NULL DEFAULT 0,
-          packets BIGINT NOT NULL DEFAULT 0,
-          flows BIGINT NOT NULL DEFAULT 0,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          PRIMARY KEY (day, src, dst, proto, dport)
-        );
-        ALTER TABLE pair_daily ADD COLUMN IF NOT EXISTS dport INT NOT NULL DEFAULT 0;
-        DO $pair_daily_port_migration$
-        DECLARE
-          current_pk TEXT;
-          current_pk_definition TEXT;
-        BEGIN
-          SELECT conname, pg_get_constraintdef(oid)
-            INTO current_pk, current_pk_definition
-            FROM pg_constraint
-           WHERE conrelid = 'pair_daily'::regclass AND contype = 'p';
-          IF current_pk IS NULL OR position('dport' in lower(current_pk_definition)) = 0 THEN
-            IF current_pk IS NOT NULL THEN
-              EXECUTE format('ALTER TABLE pair_daily DROP CONSTRAINT %I', current_pk);
-            END IF;
-            ALTER TABLE pair_daily ADD CONSTRAINT pair_daily_pkey PRIMARY KEY (day, src, dst, proto, dport);
-          END IF;
-        END;
-        $pair_daily_port_migration$;
-        CREATE INDEX IF NOT EXISTS idx_pair_daily_dst ON pair_daily (dst, day DESC);
-        CREATE INDEX IF NOT EXISTS idx_pair_daily_src ON pair_daily (src, day DESC);
-        CREATE INDEX IF NOT EXISTS idx_pair_daily_dport ON pair_daily (dport, day DESC);
-        -- day é a 2ª coluna dos dois índices acima, então nenhum deles serve para
-        -- "where day >= X" (série da Reputação e recuperação de dias faltando):
-        -- sem este índice a consulta varre a tabela inteira, que não expira.
-        CREATE INDEX IF NOT EXISTS idx_pair_daily_day ON pair_daily (day DESC);
         CREATE TABLE IF NOT EXISTS watched_subnets (
           cidr TEXT PRIMARY KEY,
           name TEXT,
