@@ -14,12 +14,17 @@ const {
   addServerIp, deleteServerIp, createApplication, renameApplication,
   deleteApplication, addApplicationListener, deleteApplicationListener,
   addExpectedApplicationClient, deleteExpectedApplicationClient,
-  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate
+  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
+  ensureFortigateBackupSchema,
+  listFortigateBackupPolicies, createFortigateBackupPolicy, updateFortigateBackupPolicy, deleteFortigateBackupPolicy, getFortigateBackupPolicyTargets,
+  listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups
 } = require('./db');
 const { intParam } = require('./params.js');
 const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs } = require('./fortigate.js');
 const { analyzePolicies } = require('./firewallAnalysis.js');
 const cron = require('node-cron');
+const { downloadBackup, saveBackupFile, readBackupFile, deleteBackupFile } = require('./fortigate-backup');
+const { runFortigateBackup } = require('./fortigate-backup');
 
 dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
 
@@ -288,6 +293,154 @@ app.get('/api/fortigate/:id/analysis', async (req, res) => {
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao analisar políticas FortiGate', detail: String(e.message || e) });
+  }
+});
+
+// ---- FortiGate Backups ------------------------------------------------
+app.get('/api/fortigate-backup/policies', async (_req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    res.json({ policies: await listFortigateBackupPolicies() });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao listar políticas de backup', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/fortigate-backup/policies', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const policy = await createFortigateBackupPolicy(req.body || {});
+    res.status(201).json({ policy });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao criar política de backup', detail: String(e.message || e) });
+  }
+});
+
+app.put('/api/fortigate-backup/policies/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const policy = await updateFortigateBackupPolicy(id, req.body || {});
+    res.json({ policy });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao atualizar política de backup', detail: String(e.message || e) });
+  }
+});
+
+app.delete('/api/fortigate-backup/policies/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    res.json(await deleteFortigateBackupPolicy(id));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao remover política de backup', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/fortigate/:id/backup', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { firewall, credentials } = await fortigateCredentials(id);
+    const record = await runFortigateBackup({ fortigate: { id: firewall.id, name: firewall.name, host: credentials.host, token: credentials.token, vdom: credentials.vdom }, policyId: null, retentionDays: Number(req.body?.retentionDays || 30) });
+    res.json({ backup: record });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao executar backup', detail: String(e.message || e) });
+  }
+});
+
+app.post('/api/fortigate-backup/policies/:id/run', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const policyId = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const policies = await listFortigateBackupPolicies();
+    const policy = policies.find((p) => p.id === policyId);
+    if (!policy) return res.status(404).json({ error: 'Política não encontrada' });
+    const targets = await getFortigateBackupPolicyTargets(policyId);
+    const results = [];
+    for (const t of targets) {
+      try {
+        const fg = await getFortigate(t.fortigate_id);
+        if (!fg) throw new Error('FortiGate não encontrado');
+        const rec = await runFortigateBackup({ fortigate: fg, policyId, retentionDays: policy.retention_days });
+        results.push({ fortigateId: fg.id, ok: true, backup: rec });
+      } catch (e) {
+        results.push({ fortigateId: t.fortigate_id, ok: false, error: e.message });
+      }
+    }
+    res.json({ results });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao executar política', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate-backups', async (_req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    try { await db.fixStuckFortigateBackups(); } catch {}
+    res.json({ backups: await listFortigateBackups() });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao listar backups', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate-backups/:id/content', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const backup = await getFortigateBackup(id);
+    if (!backup) return res.status(404).json({ error: 'Backup não encontrado' });
+    const content = await readBackupFile(backup.file_path || backup.filePath);
+    res.json({ content, fileName: backup.file_name || backup.fileName });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao ler backup', detail: String(e.message || e) });
+  }
+});
+
+app.get('/api/fortigate-backups/:id/download', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const backup = await getFortigateBackup(id);
+    if (!backup) return res.status(404).json({ error: 'Backup não encontrado' });
+    const content = await readBackupFile(backup.file_path || backup.filePath);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${backup.file_name || backup.fileName || 'backup.conf'}"`);
+    res.send(content);
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao baixar backup', detail: String(e.message || e) });
+  }
+});
+
+app.delete('/api/fortigate-backups/:id', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    await ensureFortigateBackupSchema();
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const backup = await getFortigateBackup(id);
+    if (backup) await deleteBackupFile(backup.file_path || backup.filePath);
+    res.json(await deleteFortigateBackupRecord(id));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao remover backup', detail: String(e.message || e) });
   }
 });
 

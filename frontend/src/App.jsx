@@ -5,6 +5,8 @@ import InventoryScreen from './screens/Inventory.jsx';
 import ReputationScreen from './screens/Reputation.jsx';
 import ExposureScreen from './screens/Exposure.jsx';
 import MapScreen from './screens/Map.jsx';
+import FortigateBackupsScreen from './screens/FortigateBackups.jsx';
+
 import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
 
 const PRESETS = [
@@ -268,7 +270,7 @@ function FortigatePage() {
           <form className="cmp-form inventory-create-form" onSubmit={saveFirewall}>
             <label className="fortigate-field"><span>Nome de identificação</span><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex.: FGT-Matriz" required /></label>
             <label className="fortigate-field"><span>Endereço do equipamento</span><input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="IP ou hostname" required /></label>
-            <label className="fortigate-field"><span>{editingId ? 'Substituir token (opcional)' : 'Token de API'}</span><input type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Deixe vazio para manter o atual' : 'Token API'} required={!editingId} autoComplete="new-password" /></label>
+            <label className="fortigate-field"><span>{editingId ? 'Substituir token (opcional)' : 'Token de API'}</span><input className="input" type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Deixe vazio para manter o atual' : 'Token API'} required={!editingId} autoComplete="new-password" /></label>
             <button className="fortigate-submit" type="submit" disabled={busy === 'save'}>{busy === 'save' ? 'Salvando…' : editingId ? 'Salvar alterações' : 'Cadastrar'}</button>
             {editingId && <button type="button" className="ghost" onClick={resetForm}>Cancelar</button>}
           </form>
@@ -420,6 +422,7 @@ export default function App() {
   const [view, setView] = useState('hosts'); // hosts | subnets
   const [showNames, setShowNames] = useState(true);
   const [focusSubnet, setFocusSubnet] = useState(null);
+  const [fgTab, setFgTab] = useState('firewalls'); // firewalls | backups
   const [focusHost, setFocusHost] = useState(null); // mapa mostra só este host + vizinhos
   const [subnetEmpty, setSubnetEmpty] = useState(''); // sub-rede escolhida sem tráfego na janela
   const [repMap, setRepMap] = useState({});
@@ -503,6 +506,7 @@ const [perfMode, setPerfMode] = useState(false);
 
   function openDashboard(tab = 'applications') {
     setFortigateOpen(false);
+    setFgTab('firewalls');
     setRepDbOpen(false);
     setDashboardOpen(true);
     setDashboardTab(tab);
@@ -520,6 +524,7 @@ const [perfMode, setPerfMode] = useState(false);
 
   function openMap() {
     setFortigateOpen(false);
+    setFgTab('firewalls');
     setRepDbOpen(false);
     closeDashboard();
   }
@@ -794,6 +799,7 @@ const [perfMode, setPerfMode] = useState(false);
 
   function openInventory() {
     setFortigateOpen(false);
+    setFgTab('firewalls');
     if (!inventoryOpen) inventoryReturnMapRef.current = !dashboardOpen && !repDbOpen;
     setInventoryOpen(true);
     if (!inventoryLoading) loadInventory();
@@ -916,6 +922,8 @@ const [perfMode, setPerfMode] = useState(false);
   const [cmpData, setCmpData] = useState(null);
   const [cmpLoading, setCmpLoading] = useState(false);
   const [cmpError, setCmpError] = useState('');
+  const [fortigates, setFortigates] = useState([]);
+  useEffect(() => { fetchFortigates().then(r=>setFortigates(r?.firewalls||[])).catch(()=>{}); }, []);
 
   async function runCompare(a, b) {
     if (!a?.trim() || !b?.trim()) { setCmpError('Informe os dois IPs.'); return; }
@@ -1828,10 +1836,10 @@ cy.current.on('tap', (evt) => {
               <button className={`tool${pairsOpen ? ' active' : ''}`} onClick={() => { setPairsSubnet(''); setPairsOpen(true); loadPairs(); }} title="Top pares que mais conversam"><span className="ti" aria-hidden="true">⋈</span>Pares</button>
             </div>
             <div className="tool-group" aria-label="Segurança e exposição">
-              <button className={`tool${repDbOpen && !inventoryOpen ? ' active' : ''}${(repDb?.regions || []).some((r) => r.bad > 0) ? ' danger' : ''}`} onClick={() => { setInventoryOpen(false); setRepDbIp(null); openRep('base'); }} title="Reputação: base de IPs e verificação de cache">
+              <button className={`tool${repDbOpen && !inventoryOpen ? ' active' : ''}${(repDb?.regions || []).some((r) => r.bad > 0) ? ' danger' : ''}`} onClick={() => { setInventoryOpen(false); setFgTab('firewalls'); setRepDbIp(null); openRep('base'); }} title="Reputação: base de IPs e verificação de cache">
                 <span className="ti" aria-hidden="true">◉</span>Reputação
               </button>
-             <button className={`tool${expOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(false); setInventoryOpen(false); setExpOpen(true); loadExposure(); }} title="Exposição externa: risco por host, tráfego de entrada, destinos novos e sessões vivas">
+             <button className={`tool${expOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(false); setFgTab('firewalls'); setInventoryOpen(false); setExpOpen(true); loadExposure(); }} title="Exposição externa: risco por host, tráfego de entrada, destinos novos e sessões vivas">
                 <span className="ti" aria-hidden="true">⬡</span>Exposição
               </button>
             </div>
@@ -1839,18 +1847,25 @@ cy.current.on('tap', (evt) => {
               <button className={`tool${inventoryOpen ? ' active' : ''}`} onClick={openInventory} title="Cadastro de máquinas, IPs e aplicações"><span className="ti" aria-hidden="true">▤</span>Inventário</button>
               <button className={`tool${subnetsOpen ? ' active' : ''}`} onClick={() => setSubnetsOpen(true)} title="Sub-redes monitoradas"><span className="ti" aria-hidden="true">▦</span>Subnets</button>
               <button className="tool" onClick={() => { setLkIp(''); setLkData(null); setLkError(''); setLkOpen(true); }} title="Buscar qualquer IP no histórico (mesmo fora do mapa)"><span className="ti" aria-hidden="true">⌕</span>Buscar IP</button>
-              <button className={`tool${dashboardOpen && !inventoryOpen && dashboardTab === 'topTalkers' ? ' active' : ''}`} onClick={() => { setInventoryOpen(false); openDashboard('topTalkers'); }} title="Conversas dos IPs cadastrados no inventário">
-                <span className="ti" aria-hidden="true">≋</span>Tráfego
-              </button>
-               <button className={`tool${!inventoryOpen && !dashboardOpen && !repDbOpen && !fortigateOpen ? ' active' : ''}`} onClick={() => { setInventoryOpen(false); openMap(); }} title="Abrir mapa de conexões"><span className="ti" aria-hidden="true">⌖</span>Mapa</button>
-              <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate e análise de políticas"><span className="ti" aria-hidden="true">▣</span>FortiGate</button>
+                 <button className={`tool${!inventoryOpen && !dashboardOpen && !repDbOpen && !fortigateOpen ? ' active' : ''}`} onClick={() => { setInventoryOpen(false); openMap(); }} title="Abrir mapa de conexões"><span className="ti" aria-hidden="true">⌖</span>Mapa</button>
+                 <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setFgTab('firewalls'); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate, políticas e backups">FortiGate</button>
             </div>
           </div>
         </div>
         <div className={`loadbar ${loading ? 'on' : ''}`}><i /></div>
       </header>
 
-      {fortigateOpen && <FortigatePage />}
+      {fortigateOpen && (
+        <div className="fortigate-page full" style={{ display:'flex', flexDirection:'column', height:'calc(100vh - 90px)', overflow:'auto' }}>
+          <div style={{ display:'flex', gap:8, padding:'8px 14px', borderBottom:'1px solid var(--line)', background:'var(--panel)', flexShrink:0 }}>
+            <button className={`tool${fgTab==='firewalls'?' active':''}`} onClick={()=>setFgTab('firewalls')}>Firewalls</button>
+            <button className={`tool${fgTab==='backups'?' active':''}`} onClick={()=>setFgTab('backups')}>Backups</button>
+          </div>
+          <div style={{ flex:1, overflow:'auto' }}>
+            {fgTab === 'firewalls' ? <FortigatePage /> : <FortigateBackupsScreen firewalls={fortigates} onClose={()=>setFortigateOpen(false)} />}
+          </div>
+        </div>
+      )}
 
       {dashboardOpen && <DashboardScreen {...dashboardScreenProps} />}
 

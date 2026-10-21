@@ -796,7 +796,7 @@ tr.subrow td { background: #f5f7f7; }
 .dashboard-machine.active { border-color: #8bcba7; background: #eaf7ef; box-shadow: inset 3px 0 #20b875; }
 .dashboard-machine-name { color: #30383b; }
 .dashboard-machine-meta { color: #7a8488; }
-.dashboard-data-table { min-width: 790px; table-layout: fixed; font-size: 11px; }
+.dashboard-data-table { min-width: 790px; font-size: 11px; }
 .dashboard-data-table th { padding: 7px 9px; }
 .dashboard-data-table td { padding: 7px 9px; vertical-align: middle; }
 .dashboard-data-table th:first-child { width: 23%; }

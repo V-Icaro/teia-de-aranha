@@ -1,0 +1,11 @@
+# Copiar env
+cp .env.example .env
+
+# Ajustar senhas se quiser
+
+# Subir tudo
+docker compose up --build -d
+
+# Ver logs
+docker compose logs -f backend
+docker compose logs -f frontend

@@ -18,6 +18,8 @@ pnpm-debug.log*
 
 # Backups e dumps locais
 backend/.backup/
+backend/storage/
+backend/storage/backups/
 
 # Arquivos do sistema operacional e editores
 .DS_Store

@@ -514,6 +514,239 @@ async function deleteFortigate(id) {
   return { ok: true, id: Number(id) };
 }
 
+// ---- backups FortiGate -------------------------------------------------
+async function ensureFortigateBackupSchema() {
+  await pool.query(`create table if not exists fortigate_backup_policies (
+    id serial primary key,
+    name text not null,
+    enabled boolean not null default true,
+    hour integer not null default 2 check (hour between 0 and 23),
+    minute integer not null default 0 check (minute between 0 and 59),
+    timezone text not null default 'America/Sao_Paulo',
+    run_all_days boolean not null default true,
+    days_of_week jsonb not null default '[]'::jsonb,
+    retention_days integer not null default 7 check (retention_days > 0),
+    description text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`);
+  await pool.query(`create table if not exists fortigate_backup_policy_targets (
+    policy_id integer not null references fortigate_backup_policies(id) on delete cascade,
+    fortigate_id integer not null references fortigate(id) on delete cascade,
+    primary key (policy_id, fortigate_id)
+  )`);
+  await pool.query(`create table if not exists fortigate_backups (
+    id serial primary key,
+    fortigate_id integer not null references fortigate(id) on delete cascade,
+    policy_id integer references fortigate_backup_policies(id) on delete set null,
+    status text not null default 'pending' check (status in ('pending','running','success','error')),
+    file_name text,
+    file_path text,
+    size_bytes bigint,
+    error_msg text,
+    started_at timestamptz,
+    finished_at timestamptz,
+    created_at timestamptz not null default now()
+  )`);
+  await pool.query('create index if not exists idx_fg_backups_fg on fortigate_backups(fortigate_id, created_at desc)');
+  await pool.query('create index if not exists idx_fg_backups_policy on fortigate_backups(policy_id, created_at desc)');
+}
+
+async function listFortigateBackupPolicies() {
+  await ensureFortigateBackupSchema();
+  const { rows } = await pool.query(`select p.*,
+    coalesce((select jsonb_agg(jsonb_build_object('id', f.id, 'name', f.name, 'host', f.host))
+              from fortigate_backup_policy_targets t join fortigate f on f.id = t.fortigate_id
+              where t.policy_id = p.id), '[]'::jsonb) as targets
+   from fortigate_backup_policies p order by p.id desc`);
+  return rows.map((r) => ({
+    id: Number(r.id),
+    name: r.name,
+    enabled: r.enabled,
+    hour: Number(r.hour),
+    minute: Number(r.minute),
+    timezone: r.timezone,
+    runAllDays: r.run_all_days,
+    daysOfWeek: r.days_of_week || [],
+    retentionDays: Number(r.retention_days),
+    description: r.description,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    targets: r.targets || []
+  }));
+}
+
+async function createFortigateBackupPolicy(data) {
+  await ensureFortigateBackupSchema();
+  const r = await pool.query(`insert into fortigate_backup_policies (name, enabled, hour, minute, timezone, run_all_days, days_of_week, retention_days, description)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
+    [data.name, data.enabled !== false, Number(data.hour)||0, Number(data.minute)||0, data.timezone || 'America/Sao_Paulo', data.runAllDays !== false, JSON.stringify(data.daysOfWeek||[]), Number(data.retentionDays)||7, data.description||null]);
+  const p = r.rows[0];
+  if (Array.isArray(data.targetFortigateIds) && data.targetFortigateIds.length) {
+    const c = await pool.connect();
+    try {
+      await c.query('begin');
+      for (const fid of data.targetFortigateIds) {
+        const id = Number(fid);
+        if (!Number.isSafeInteger(id)) continue;
+        await c.query('insert into fortigate_backup_policy_targets (policy_id, fortigate_id) values ($1,$2) on conflict do nothing', [p.id, id]);
+      }
+      await c.query('commit');
+    } catch (e) { await c.query('rollback').catch(()=>{}); throw e; } finally { c.release(); }
+  }
+  const list = await listFortigateBackupPolicies();
+  return list.find((x) => x.id === Number(p.id));
+}
+
+async function updateFortigateBackupPolicy(id, data) {
+  await ensureFortigateBackupSchema();
+  const sets = [];
+  const values = [Number(id)];
+  if (data.name !== undefined) { const clean = String(data.name||'').trim(); if (!clean) throw Object.assign(new Error('Nome não pode ficar vazio.'), { status: 400 }); values.push(clean); sets.push(`name = $${values.length}`); }
+  if (data.enabled !== undefined) { values.push(!!data.enabled); sets.push(`enabled = $${values.length}`); }
+  if (data.hour !== undefined) { values.push(Number(data.hour)); sets.push(`hour = $${values.length}`); }
+  if (data.minute !== undefined) { values.push(Number(data.minute)); sets.push(`minute = $${values.length}`); }
+  if (data.timezone !== undefined) { values.push(String(data.timezone||'America/Sao_Paulo')); sets.push(`timezone = $${values.length}`); }
+  if (data.runAllDays !== undefined) { values.push(!!data.runAllDays); sets.push(`run_all_days = $${values.length}`); }
+  if (data.daysOfWeek !== undefined) { values.push(JSON.stringify(data.daysOfWeek||[])); sets.push(`days_of_week = $${values.length}`); }
+  if (data.retentionDays !== undefined) { values.push(Number(data.retentionDays)||7); sets.push(`retention_days = $${values.length}`); }
+  if (data.description !== undefined) { values.push(data.description||null); sets.push(`description = $${values.length}`); }
+  if (!sets.length && !Array.isArray(data.targetFortigateIds)) throw Object.assign(new Error('Informe algo para atualizar.'), { status: 400 });
+  if (sets.length) {
+    const { rowCount } = await pool.query(`update fortigate_backup_policies set ${sets.join(', ')}, updated_at = now() where id = $1`, values);
+    if (!rowCount) throw Object.assign(new Error('Política não encontrada'), { status: 404 });
+  } else {
+    const { rowCount } = await pool.query('select id from fortigate_backup_policies where id = $1', [id]);
+    if (!rowCount) throw Object.assign(new Error('Política não encontrada'), { status: 404 });
+  }
+  if (Array.isArray(data.targetFortigateIds)) {
+    const c = await pool.connect();
+    try {
+      await c.query('begin');
+      await c.query('delete from fortigate_backup_policy_targets where policy_id = $1', [id]);
+      for (const fid of data.targetFortigateIds) {
+        const fidn = Number(fid);
+        if (!Number.isSafeInteger(fidn)) continue;
+        await c.query('insert into fortigate_backup_policy_targets (policy_id, fortigate_id) values ($1,$2) on conflict do nothing', [id, fidn]);
+      }
+      await c.query('commit');
+    } catch (e) { await c.query('rollback').catch(()=>{}); throw e; } finally { c.release(); }
+  }
+  const list = await listFortigateBackupPolicies();
+  return list.find((x) => x.id === Number(id));
+}
+
+async function deleteFortigateBackupPolicy(id) {
+  await ensureFortigateBackupSchema();
+  const r = await pool.query('delete from fortigate_backup_policies where id = $1', [id]);
+  if (!r.rowCount) throw Object.assign(new Error('Política não encontrada'), { status: 404 });
+  return { ok: true, id: Number(id) };
+}
+
+async function getFortigateBackupPolicyTargets(policyId) {
+  await ensureFortigateBackupSchema();
+  const { rows } = await pool.query(`select t.fortigate_id, f.name, f.host, f.vdom
+    from fortigate_backup_policy_targets t join fortigate f on f.id = t.fortigate_id
+    where t.policy_id = $1 order by f.name`, [policyId]);
+  return rows;
+}
+
+async function listFortigateBackups(filters = {}) {
+  await ensureFortigateBackupSchema();
+  const clauses = [];
+  const params = [];
+  if (filters.fortigateId) { params.push(Number(filters.fortigateId)); clauses.push(`b.fortigate_id = $${params.length}`); }
+  if (filters.policyId) { params.push(Number(filters.policyId)); clauses.push(`b.policy_id = $${params.length}`); }
+  const where = clauses.length ? `where ${clauses.join(' and ')}` : '';
+  const { rows } = await pool.query(`select b.*, f.name as fortigate_name, f.host as fortigate_host, p.name as policy_name
+    from fortigate_backups b
+    left join fortigate f on f.id = b.fortigate_id
+    left join fortigate_backup_policies p on p.id = b.policy_id
+    ${where}
+    order by b.created_at desc
+    limit 500`, params);
+  return rows.map((r) => ({
+    id: Number(r.id),
+    fortigateId: Number(r.fortigate_id),
+    policyId: r.policy_id == null ? null : Number(r.policy_id),
+    status: r.status,
+    fileName: r.file_name,
+    filePath: r.file_path,
+    sizeBytes: r.size_bytes == null ? null : Number(r.size_bytes),
+    errorMsg: r.error_msg,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    createdAt: r.created_at,
+    fortigateName: r.fortigate_name,
+    fortigateHost: r.fortigate_host,
+    policyName: r.policy_name
+  }));
+}
+
+async function getFortigateBackup(id) {
+  await ensureFortigateBackupSchema();
+  const { rows } = await pool.query(`select b.*, f.name as fortigate_name, f.host as fortigate_host
+    from fortigate_backups b left join fortigate f on f.id = b.fortigate_id where b.id = $1`, [id]);
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    id: Number(r.id),
+    fortigateId: Number(r.fortigate_id),
+    policyId: r.policy_id == null ? null : Number(r.policy_id),
+    status: r.status,
+    fileName: r.file_name,
+    filePath: r.file_path,
+    sizeBytes: r.size_bytes == null ? null : Number(r.size_bytes),
+    errorMsg: r.error_msg,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    createdAt: r.created_at,
+    fortigateName: r.fortigate_name,
+    fortigateHost: r.fortigate_host
+  };
+}
+
+async function createFortigateBackupRecord({ fortigateId, policyId = null }) {
+  await ensureFortigateBackupSchema();
+  const r = await pool.query(`insert into fortigate_backups (fortigate_id, policy_id, status, started_at)
+    values ($1,$2,'running',now()) returning *`, [Number(fortigateId), policyId == null ? null : Number(policyId)]);
+  return r.rows[0];
+}
+
+async function updateFortigateBackupRecord(id, patch) {
+  await ensureFortigateBackupSchema();
+  const sets = [];
+  const params = [Number(id)];
+  if (patch.status !== undefined) { params.push(patch.status); sets.push(`status = $${params.length}`); }
+  if (patch.fileName !== undefined) { params.push(patch.fileName); sets.push(`file_name = $${params.length}`); }
+  if (patch.filePath !== undefined) { params.push(patch.filePath); sets.push(`file_path = $${params.length}`); }
+  if (patch.sizeBytes !== undefined) { params.push(patch.sizeBytes == null ? null : Number(patch.sizeBytes)); sets.push(`size_bytes = $${params.length}`); }
+  if (patch.errorMsg !== undefined) { params.push(patch.errorMsg); sets.push(`error_msg = $${params.length}`); }
+  if (patch.finishedAt || patch.status === 'success' || patch.status === 'error') { sets.push('finished_at = now()'); }
+  if (!sets.length) return;
+  await pool.query(`update fortigate_backups set ${sets.join(', ')} where id = $1`, params);
+}
+
+async function deleteFortigateBackupRecord(id) {
+  await ensureFortigateBackupSchema();
+  const { rows } = await pool.query('delete from fortigate_backups where id = $1 returning file_path', [Number(id)]);
+  return rows[0] || null;
+}
+
+async function cleanupFortigateBackups({ fortigateId, retentionDays }) {
+  await ensureFortigateBackupSchema();
+  const { rows } = await pool.query(`select id, file_path from fortigate_backups
+    where fortigate_id = $1 and status = 'success' and created_at < now() - ($2::int * interval '1 day')
+    order by created_at asc`, [Number(fortigateId), Number(retentionDays)]);
+  return rows;
+}
+
+async function fixStuckFortigateBackups() {
+  await ensureFortigateBackupSchema();
+  const r = await pool.query(`update fortigate_backups set status='error', error_msg='Finalizado forçadamente (travado em running)', finished_at=now() where status='running' and created_at < now() - interval '2 minutes' returning id`);
+  return { fixed: r.rowCount };
+}
+
 module.exports = {
   pool, init, listSubnets, addSubnet, patchSubnet, delSubnet,
   listInventory, inventoryNamesFor, inventoryNameFor, inventoryApplicationsForIp,
@@ -521,5 +754,8 @@ module.exports = {
   addServerIp, deleteServerIp, createApplication, renameApplication,
   deleteApplication, addApplicationListener, deleteApplicationListener,
   addExpectedApplicationClient, deleteExpectedApplicationClient,
-  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate
+  listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
+  ensureFortigateBackupSchema,
+  listFortigateBackupPolicies, createFortigateBackupPolicy, updateFortigateBackupPolicy, deleteFortigateBackupPolicy, getFortigateBackupPolicyTargets,
+  listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups, fixStuckFortigateBackups
 };

@@ -1,22 +1,52 @@
 services:
-  postgres:
+  db:
     image: postgres:16-alpine
-    container_name: teia-postgres
+    container_name: teia-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: teia
-      POSTGRES_PASSWORD: ""
-      POSTGRES_DB: teiadeanha
-      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_DB: ${POSTGRES_DB:-teia_aranha}
+      POSTGRES_USER: ${POSTGRES_USER:-teia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-teia_strong_password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U teia -d teiadeanha"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-teia} -d ${POSTGRES_DB:-teia_aranha}"]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: teia-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PORT: ${PORT:-3001}
+      NODE_ENV: ${NODE_ENV:-production}
+    volumes:
+      - ./backend/storage:/app/storage
+    ports:
+      - "3001:3001"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: teia-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
 
 volumes:
-  pgdata:
+  pg_data:
