@@ -13,8 +13,9 @@
 // risco da MUDANÇA e o que validar antes de mexer. Sem IA: regras claras.
 //
 // Não implementado nesta versão (documentado em limitations):
-//   - sombreamento/precedência fina entre regras (exige match de VIP, identidade,
-//     agenda efetiva e ferramentas de "policy lookup");
+//   - sombreamento/precedência fina entre regras (só o caso "regra anterior
+//     ALL/ALL/ALL no mesmo par de interfaces" é detectado; VIP, identidade e
+//     agenda efetiva exigem o "policy lookup");
 //   - objetos de endereço/serviço órfãos (exige a API de objetos + grafo de
 //     referências);
 //   - "hits por intervalo" confiável e mudança anormal (exige snapshots periódicos).
@@ -80,14 +81,57 @@ function fmtBytes(n) {
   return `${(n / 1024 ** 5).toFixed(2)} PB`;
 }
 
+function fmtEpoch(epoch) {
+  if (!epoch) return 'nunca registrado';
+  const d = new Date(Number(epoch) * 1000);
+  return Number.isNaN(d.getTime()) ? String(epoch) : d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+}
+
+function isAnyIntf(list) {
+  return Array.isArray(list) && list.some((n) => String(n).trim().toLowerCase() === 'any');
+}
+
+// `outer` cobre todas as interfaces de `inner` (ou é "any").
+function coversIntf(outer, inner) {
+  if (isAnyIntf(outer)) return true;
+  if (!Array.isArray(outer) || !Array.isArray(inner) || !inner.length) return false;
+  const set = new Set(outer.map((x) => String(x).trim().toLowerCase()));
+  return inner.every((x) => set.has(String(x).trim().toLowerCase()));
+}
+
+const IDENTITY_KEYS = new Set(['groups', 'users', 'fsso-groups']);
+
+// Regra "pega tudo" no par de interfaces: origem, destino e serviço ALL,
+// agenda sempre, sem negação, sem Internet Service e sem identidade.
+function isCatchAll(p) {
+  if (String(p.status || 'enable').toLowerCase() === 'disable') return false;
+  if (!isAny(p.flow.srcaddr) || !isAny(p.flow.dstaddr) || !isAny(p.services.service)) return false;
+  if (String(p.schedule || '').toLowerCase() !== 'always') return false;
+  if (String(p.flow.internetService || '').toLowerCase() === 'enable') return false;
+  if ([p.flow.srcaddrNegate, p.flow.dstaddrNegate, p.services.serviceNegate].some((v) => String(v || '').toLowerCase() === 'enable')) return false;
+  if ((p.advanced || []).some((a) => IDENTITY_KEYS.has(a.key))) return false;
+  return true;
+}
+
 // Construtor único de achado: garante o formato prometido.
 function finding_(rule, ctx, extra) {
+  const s = ctx.stats;
   const base = {
     id: `${rule}-${ctx.config.policyid}`,
     rule,
     policyid: ctx.config.policyid,
     policyName: ctx.config.name || null,
     position: ctx.config.position || null,
+    // Contexto da regra para a tela não precisar de outra consulta.
+    policy: {
+      status: ctx.config.status || 'enable',
+      action: ctx.config.action || null,
+      srcintf: ctx.config.flow?.srcintf || [],
+      dstintf: ctx.config.flow?.dstintf || [],
+      hitCount: s ? (s.hitCount || 0) : null,
+      bytes: s ? (s.bytes || 0) : null,
+      lastUsed: s?.lastUsed || null
+    },
     category: '',
     severity: 'baixa',
     confidence: 'media',
@@ -116,6 +160,7 @@ function evaluate({ configs, stats, now, options }) {
   // Índice por assinatura para duplicidade.
   const bySig = new Map();
   for (const r of rows) {
+    if (String(r.config.status || 'enable').toLowerCase() === 'disable') continue;
     const sig = signature(r.config);
     if (!bySig.has(sig)) bySig.set(sig, []);
     bySig.get(sig).push(r);
@@ -125,10 +170,90 @@ function evaluate({ configs, stats, now, options }) {
   const eager = (f) => { if (f) findings.push(f); };
   const push = (rule, ctx, extra) => eager(finding_(rule, ctx, extra));
 
+  // Regras "pega tudo" habilitadas, em ordem de posição (para sombreamento).
+  const catchAlls = rows.filter((r) => isCatchAll(r.config)).sort((a, b) => a.config.position - b.config.position);
+
   for (const ctx of rows) {
     const p = ctx.config;
     const s = ctx.stats;
+    const disabled = String(p.status || 'enable').toLowerCase() === 'disable';
     const accept = String(p.action || '').toLowerCase() === 'accept';
+
+    // 13. Regra desabilitada: candidata a limpeza; não avalia uso/segurança.
+    if (disabled) {
+      push('disabled', ctx, {
+        category: 'Regra desabilitada',
+        severity: 'baixa',
+        confidence: 'alta',
+        impact: 'organizacao',
+        changeRisk: 'baixo',
+        problem: 'A política está desabilitada e não processa tráfego.',
+        recommendation: 'Se não for uma regra de contingência, documente o motivo ou remova-a para simplificar a lista.',
+        evidence: ['status = disable', `último uso = ${fmtEpoch(s?.lastUsed)}`],
+        validation: 'Regras desabilitadas costumam ser guardadas para rollback ou contingência. Confirme com o responsável antes de remover.'
+      });
+      continue;
+    }
+
+    // 14. Sombreamento: uma regra anterior "pega tudo" no mesmo par de interfaces.
+    const shadow = catchAlls.find((q) => q.config.position < p.position
+      && coversIntf(q.config.flow.srcintf, p.flow.srcintf)
+      && coversIntf(q.config.flow.dstintf, p.flow.dstintf));
+    if (shadow) {
+      const q = shadow.config;
+      const differentAction = String(q.action || '').toLowerCase() !== String(p.action || '').toLowerCase();
+      const hasHits = (s?.hitCount || 0) > 0;
+      push('shadowed', ctx, {
+        category: 'Regra possivelmente sombreada',
+        severity: differentAction ? 'alta' : 'media',
+        confidence: hasHits ? 'baixa' : 'media',
+        impact: differentAction ? 'seguranca' : 'organizacao',
+        changeRisk: 'alto',
+        problem: `A regra "${q.name || q.policyid}" (seq ${q.position}) vem antes e aceita origem, destino e serviço ALL nas mesmas interfaces; esta política tende a nunca ser avaliada.${differentAction ? ` As ações são diferentes (${q.action} antes, ${p.action} aqui), então a intenção desta regra pode não estar valendo.` : ''}`,
+        recommendation: differentAction
+          ? 'Revise a ordem: se esta regra deve valer, ela precisa ficar acima da regra ampla.'
+          : 'Se a regra ampla já cobre este fluxo, avalie remover esta; senão, mova-a para cima.',
+        evidence: [
+          `regra anterior: ${q.name || '—'} (ID ${q.policyid}, seq ${q.position}, ação ${q.action})`,
+          `interfaces anteriores: ${(q.flow.srcintf || []).join(', ')} → ${(q.flow.dstintf || []).join(', ')}`,
+          'regra anterior: srcaddr = ALL, dstaddr = ALL, service = ALL, schedule = always',
+          `hits desta política = ${s ? s.hitCount || 0 : 'sem estatística'}`
+        ],
+        validation: hasHits
+          ? 'Esta política tem hits, o que contradiz o sombreamento: provavelmente há VIP, identidade, ISDB ou outro critério que a análise não cobre. Confira com o Policy Lookup.'
+          : 'A análise não considera VIP, identidade de usuário, ISDB nem central NAT. Confirme com o Policy Lookup do FortiGate antes de mexer.'
+      });
+    }
+
+    // 15. Interface ANY em regra de permissão.
+    if (accept && (isAnyIntf(p.flow.srcintf) || isAnyIntf(p.flow.dstintf))) {
+      push('any_interface', ctx, {
+        category: 'Interface ANY em permissão',
+        severity: 'media',
+        confidence: 'alta',
+        impact: 'seguranca',
+        changeRisk: 'medio',
+        problem: 'A política aceita tráfego usando a interface "any", válida para qualquer zona do equipamento.',
+        recommendation: 'Troque "any" pelas interfaces ou zonas que realmente participam do fluxo.',
+        evidence: [`srcintf = ${(p.flow.srcintf || []).join(', ') || '—'}`, `dstintf = ${(p.flow.dstintf || []).join(', ') || '—'}`],
+        validation: 'Interface "any" também desliga a visão por par de interfaces no FortiGate. Confira se ela é usada de propósito (ex.: regra de gerência).'
+      });
+    }
+
+    // 16. Permissão sem log.
+    if (accept && String(p.security.logtraffic || '').toLowerCase() === 'disable') {
+      push('no_logging', ctx, {
+        category: 'Permissão sem registro de log',
+        severity: 'media',
+        confidence: 'alta',
+        impact: 'auditoria',
+        changeRisk: 'baixo',
+        problem: 'A política aceita tráfego com log desabilitado; não há rastro das sessões permitidas.',
+        recommendation: 'Habilite ao menos "Eventos de segurança" (utm) ou "Todas as sessões" conforme a necessidade de auditoria.',
+        evidence: ['logtraffic = disable', `hits = ${s ? s.hitCount || 0 : 'sem estatística'}`],
+        validation: '"Todas as sessões" em regra de alto volume aumenta o uso de disco/FortiAnalyzer. Avalie a capacidade antes.'
+      });
+    }
     const serviceAll = isAny(p.services.service);
     const srcAll = isAny(p.flow.srcaddr);
     const dstAll = isAny(p.flow.dstaddr);
@@ -149,7 +274,7 @@ function evaluate({ configs, stats, now, options }) {
         changeRisk: 'alto',
         problem: 'A política não registra correspondências no contador de hits.',
         recommendation: 'Verifique se ainda é necessária antes de considerar desativá-la.',
-        evidence: [`hit_count = 0`, `last_used = ${s.lastUsed || 'nunca registrado'}`],
+        evidence: [`hit_count = 0`, `last_used = ${fmtEpoch(s.lastUsed)}`],
         validation: 'Zero hits não prova que a regra é inútil: pode ser sazonal, de contingência/DR ou de baixa frequência. Confira o período desde o último reset dos contadores e os logs antes de mexer.'
       });
     }
@@ -165,7 +290,7 @@ function evaluate({ configs, stats, now, options }) {
         changeRisk: 'medio',
         problem: `A política teve uso no passado, mas o último hit foi há ~${Math.round(idleDays)} dias.`,
         recommendation: 'Confirme se o serviço ainda é necessário; se a janela for longa o bastante, planeje desativação com retorno.',
-        evidence: [`hit_count = ${s.hitCount}`, `último uso há ${Math.round(idleDays)} dias`, `janela de ${staleDays} dias`],
+        evidence: [`hit_count = ${s.hitCount}`, `último uso = ${fmtEpoch(s.lastUsed)} (há ${Math.round(idleDays)} dias)`, `janela de ${staleDays} dias`],
         validation: 'Defina a janela (30/60/90 dias) conforme o serviço e considere reset de contadores e tráfego sazonal.'
       });
     }
@@ -336,10 +461,19 @@ function analyzePolicies({ configs = [], stats = [], now = Date.now(), options =
 
   const bySeverity = { alta: 0, media: 0, baixa: 0 };
   const byCategory = {};
+  const byImpact = {};
+  const penaltyByPolicy = new Map();
+  const WEIGHT = { alta: 3, media: 1.5, baixa: 0.5 };
   for (const f of findings) {
     bySeverity[f.severity] = (bySeverity[f.severity] || 0) + 1;
     byCategory[f.category] = (byCategory[f.category] || 0) + 1;
+    byImpact[f.impact] = (byImpact[f.impact] || 0) + 1;
+    penaltyByPolicy.set(f.policyid, (penaltyByPolicy.get(f.policyid) || 0) + (WEIGHT[f.severity] || 0));
   }
+  // Nota de 0 a 100: cada política perde no máximo 3 pontos-peso (um achado
+  // de severidade alta), então poucas regras ruins não zeram a nota.
+  const totalPenalty = [...penaltyByPolicy.values()].reduce((sum, v) => sum + Math.min(3, v), 0);
+  const score = configs.length ? Math.max(0, Math.round(100 * (1 - totalPenalty / (3 * configs.length)))) : null;
 
   findings.sort((a, b) =>
     (SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity]) ||
@@ -354,13 +488,17 @@ function analyzePolicies({ configs = [], stats = [], now = Date.now(), options =
       totalPolicies: configs.length,
       policiesWithStats: withStats,
       findings: findings.length,
+      affectedPolicies: penaltyByPolicy.size,
+      disabledPolicies: configs.filter((c) => String(c.status || 'enable').toLowerCase() === 'disable').length,
+      score,
       bySeverity,
-      byCategory
+      byCategory,
+      byImpact
     },
     findings,
     limitations: [
       'Detecção determinística: não aplica mudanças e não substitui a ferramenta de "policy lookup" do FortiGate.',
-      'Sombreamento/precedência fina entre regras não é calculado nesta versão.',
+      'Sombreamento detecta só o caso simples (regra anterior com origem, destino e serviço ALL nas mesmas interfaces); VIP, identidade, ISDB e central NAT não são considerados.',
       'Objetos de endereço/serviço órfãos exigem a API de objetos e o grafo de referências (não incluído).',
       'Mudança anormal usa a série semanal do próprio equipamento; sem snapshots históricos próprios não há janela mais longa.',
       'Zero hits não prova obsolescência: regras sazonais, de contingência/DR e de baixa frequência exigem validação humana.'

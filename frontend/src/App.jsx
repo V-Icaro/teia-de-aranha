@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import cytoscape from 'cytoscape';
 import DashboardScreen from './screens/Dashboard.jsx';
 import InventoryScreen from './screens/Inventory.jsx';
@@ -6,8 +6,11 @@ import ReputationScreen from './screens/Reputation.jsx';
 import ExposureScreen from './screens/Exposure.jsx';
 import MapScreen from './screens/Map.jsx';
 import FortigateBackupsScreen from './screens/FortigateBackups.jsx';
+import FortigatePolicyTable from './screens/FortigatePolicies.jsx';
+import FortigateAnalysis from './screens/FortigateAnalysis.jsx';
+import FortigateAuditScreen from './screens/FortigateAudit.jsx';
 
-import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicies, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
+import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
 
 const PRESETS = [
   { label: 'Últimos 5 min', minutes: 5 },
@@ -35,28 +38,71 @@ function fmtWindow(useCustom, custom, minutes) {
   return (PRESETS.find((p) => p.minutes === minutes) || { label: `Últimos ${minutes} min` }).label.toLowerCase();
 }
 
+// Inventário do host em dropdown: cabeçalho com o resumo, aplicações
+// recolhidas (cada uma abre os listeners) e busca quando a lista é longa.
+// Máquinas com muitas aplicações viravam um scroll enorme no painel.
 function InventoryContext({ data }) {
+  const apps = data?.applications || [];
+  const [open, setOpen] = useState(apps.length <= 2);
+  const [openApps, setOpenApps] = useState(() => new Set());
+  const [filter, setFilter] = useState('');
   if (!data) return null;
+
+  const listenerCount = apps.reduce((sum, app) => sum + (app.listeners?.length || 0), 0);
+  const term = filter.trim().toLowerCase();
+  const shown = term
+    ? apps.filter((app) => app.name.toLowerCase().includes(term)
+      || (app.listeners || []).some((l) => `${l.ip} ${l.protocol}/${l.port}`.toLowerCase().includes(term)))
+    : apps;
+  const toggleApp = (id) => setOpenApps((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const allOpen = shown.length > 0 && shown.every((app) => openApps.has(app.id));
+
   return (
-    <section className="inventory-context">
-      <div className="talker-top">
-        <b>{data.serverName}</b>
+    <section className={`inventory-context${open ? ' open' : ''}`}>
+      <button type="button" className="inv-ctx-head" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className="inv-ctx-caret" aria-hidden="true">{open ? '▾' : '▸'}</span>
+        <span className="inv-ctx-title">
+          <b>{data.serverName}</b>
+          <small>{apps.length ? `${apps.length} ${apps.length === 1 ? 'aplicação' : 'aplicações'} · ${listenerCount} ${listenerCount === 1 ? 'listener' : 'listeners'}` : 'sem aplicações cadastradas'}</small>
+        </span>
         <span className="badge low">Inventário</span>
-      </div>
-      {!data.applications?.length ? <p className="hint">Nenhuma aplicação cadastrada para esta máquina.</p> : (
-        <div className="inventory-context-apps">
-          {data.applications.map((app) => (
-            <div key={app.id}>
-              <b>{app.name}</b>
-              {app.listeners?.length ? (
-                <div className="tlegend">
-                  {app.listeners.map((listener) => <span key={listener.id}>{listener.ip} · {listener.protocol}/{listener.port}</span>)}
-                </div>
-              ) : <p className="hint">Sem listener configurado.</p>}
+      </button>
+
+      {open && (!apps.length ? <p className="hint">Nenhuma aplicação cadastrada para esta máquina.</p> : (
+        <>
+          {(apps.length > 5 || shown.length > 1) && (
+            <div className="inv-ctx-tools">
+              {apps.length > 5 && <input className="inv-ctx-search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filtrar por nome, IP ou porta…" />}
+              {shown.length > 1 && <button type="button" className="inv-ctx-link" onClick={() => setOpenApps(allOpen ? new Set() : new Set(shown.map((app) => app.id)))}>{allOpen ? 'Recolher todas' : 'Expandir todas'}</button>}
             </div>
-          ))}
-        </div>
-      )}
+          )}
+          <div className="inventory-context-apps">
+            {shown.map((app) => {
+              const appOpen = openApps.has(app.id);
+              const n = app.listeners?.length || 0;
+              return (
+                <div key={app.id} className={`inv-ctx-app${appOpen ? ' open' : ''}`}>
+                  <button type="button" className="inv-ctx-app-head" onClick={() => toggleApp(app.id)} aria-expanded={appOpen}>
+                    <span className="inv-ctx-caret" aria-hidden="true">{appOpen ? '▾' : '▸'}</span>
+                    <b>{app.name}</b>
+                    <small>{n ? `${n} ${n === 1 ? 'listener' : 'listeners'}` : 'sem listener'}</small>
+                  </button>
+                  {appOpen && (n ? (
+                    <div className="tlegend">
+                      {app.listeners.map((listener) => <span key={listener.id}>{listener.ip} · {listener.protocol}/{listener.port}</span>)}
+                    </div>
+                  ) : <p className="hint">Sem listener configurado.</p>)}
+                </div>
+              );
+            })}
+            {!shown.length && <p className="hint">Nenhuma aplicação para este filtro.</p>}
+          </div>
+        </>
+      ))}
     </section>
   );
 }
@@ -66,6 +112,55 @@ const NODE_COLORS = { private: '#22d3ee', subnet: '#7c3aed' };
 const REP_COLORS = { bad: '#ef4444', orange: '#f97316', yellow: '#eab308', good: '#22c55e', unknown: '#94a3b8' };
 const RISK_COLORS = { none: '#22c55e', low: '#eab308', med: '#f97316', high: '#ef4444', critical: '#b91c1c', parcial: '#94a3b8', indisponivel: '#64748b' };
 const RISK_LABELS = { none: 'sem risco nos avaliados', low: 'baixo', med: 'médio', high: 'alto', critical: 'crítico', parcial: 'avaliação parcial', indisponivel: 'indisponível' };
+
+// Grafo grande: acima disso o layout de força (cose, O(n²) por iteração)
+// trava a aba e cai para o concêntrico. Medido (headless, 250 iterações):
+// 500 nós = 2,4 s · 1.000 = 11,5 s · 2.000 = 54 s; concêntrico com 8.000
+// nós = 0,3 s. Acima de HUGE_ELEMENTS o desenho passa a usar arestas retas
+// sem seta/rótulo e esconde texto no zoom-out.
+const COSE_MAX_NODES = 400;
+const HUGE_ELEMENTS = 4000;
+
+// Valor que só "assenta" depois de `ms` sem mudar: sliders não reconstroem
+// o grafo a cada pixel arrastado.
+function useDebounced(value, ms) {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return settled;
+}
+
+// Estado que sobrevive ao recarregar a página (preferências de exibição do mapa).
+function usePersistentState(key, initial) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw == null ? initial : JSON.parse(raw);
+    } catch { return initial; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* armazenamento cheio/bloqueado */ }
+  }, [key, value]);
+  return [value, setValue];
+}
+
+// Reputação "ruim" para o destaque de risco: score >= 20 (sai do verde) ou veredito negativo.
+function isRiskyRep(r) {
+  if (!r) return false;
+  if (r.abuse?.score != null) return Number(r.abuse.score) >= 20;
+  return r.verdict === 'malicious' || r.verdict === 'suspicious';
+}
+
+function maxOf(list, pick) {
+  let max = 0;
+  for (const item of list) {
+    const v = pick(item) || 0;
+    if (v > max) max = v;
+  }
+  return max;
+}
 
 function repColorForScore(score) {
   if (score == null || score === '') return REP_COLORS.unknown;
@@ -86,11 +181,7 @@ function FortigatePage() {
   const [message, setMessage] = useState('');
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ name: '', host: '', vdom: 'root', token: '' });
-  const [policiesData, setPoliciesData] = useState(null);
-  const [policyLoading, setPolicyLoading] = useState(false);
-  const [policyError, setPolicyError] = useState('');
-  const [sort, setSort] = useState('hits');
-  const [offset, setOffset] = useState(0);
+  const [formOpen, setFormOpen] = useState(false);
   const [detail, setDetail] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [analysisTarget, setAnalysisTarget] = useState(null);
@@ -98,8 +189,6 @@ function FortigatePage() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState('');
   const [staleDays, setStaleDays] = useState(90);
-  const [analysisSeverity, setAnalysisSeverity] = useState('todas');
-  const [expandedFindingId, setExpandedFindingId] = useState(null);
 
   const selected = firewalls.find((item) => item.id === selectedId) || null;
 
@@ -120,24 +209,23 @@ function FortigatePage() {
 
   useEffect(() => { loadFirewalls(null); }, []);
 
-  useEffect(() => {
-    if (!selectedId) {
-      setPoliciesData(null);
-      return undefined;
-    }
-    let cancelled = false;
-    setPolicyLoading(true);
-    setPolicyError('');
-    fetchFortigatePolicies(selectedId, { limit: 20, sort, offset, vdom: firewalls.find((item) => item.id === selectedId)?.vdom || 'root' })
-      .then((data) => { if (!cancelled) setPoliciesData(data); })
-      .catch((e) => { if (!cancelled) setPolicyError(String(e.message || e)); })
-      .finally(() => { if (!cancelled) setPolicyLoading(false); });
-    return () => { cancelled = true; };
-  }, [selectedId, sort, offset, firewalls]);
-
   function resetForm() {
     setEditingId(null);
+    setFormOpen(false);
     setForm({ name: '', host: '', vdom: 'root', token: '' });
+  }
+
+  function openNewForm() {
+    if (formOpen && !editingId) return resetForm();
+    setEditingId(null);
+    setForm({ name: '', host: '', vdom: 'root', token: '' });
+    setFormOpen(true);
+  }
+
+  function openEditForm(firewall) {
+    setEditingId(firewall.id);
+    setForm({ name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root', token: '' });
+    setFormOpen(true);
   }
 
   async function saveFirewall(event) {
@@ -205,17 +293,18 @@ function FortigatePage() {
     }
   }
 
-  async function runAnalysis(firewall) {
+  async function runAnalysis(firewall, days = staleDays) {
     if (!firewall) return;
     const requestId = analysisRequestRef.current + 1;
     analysisRequestRef.current = requestId;
     setSelectedId(firewall.id);
+    // Recalcular o mesmo firewall mantém o resultado anterior na tela até chegar o novo.
+    if (analysisTarget?.id !== firewall.id) setAnalysis(null);
     setAnalysisTarget({ id: firewall.id, name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root' });
-    setAnalysis({ loading: true });
     setAnalysisError('');
     setAnalysisLoading(true);
     try {
-      const result = await fetchFortigateAnalysis(firewall.id, { staleDays, vdom: firewall.vdom || 'root' });
+      const result = await fetchFortigateAnalysis(firewall.id, { staleDays: days, vdom: firewall.vdom || 'root' });
       if (analysisRequestRef.current === requestId) setAnalysis(result);
     } catch (e) {
       if (analysisRequestRef.current === requestId) {
@@ -235,105 +324,92 @@ function FortigatePage() {
     setAnalysisLoading(false);
   }
 
-  const dateValue = (value) => {
-    if (value == null || value === 0) return '—';
-    const n = Number(value);
-    const date = new Date(n > 1e12 ? n : n * 1000);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('pt-BR');
-  };
-  const severityLabel = (value) => ({ alta: 'Alta', media: 'Média', baixa: 'Baixa' }[value] || value || '—');
-  const findingClass = (value) => ({ alta: 'high', media: 'med', baixa: 'low' }[value] || 'low');
-  const shownFindings = (analysis?.findings || []).filter((finding) => analysisSeverity === 'todas' || finding.severity === analysisSeverity);
   const detailValue = (value) => Array.isArray(value) ? value.join(', ') : (typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value));
 
   return (
     <main className="page-fortigate">
-      <div className="page-head fortigate-page-head">
+      <div className="fgt-head">
         <div className="page-title">
           <span className="fortigate-page-icon" aria-hidden="true">FG</span>
-          <div><h2>FortiGate</h2><span className="hint">Gestão de firewalls e análise consultiva de políticas</span></div>
+          <div><h2>Firewalls</h2><span className="hint">Equipamentos FortiGate e políticas de firewall</span></div>
         </div>
         <div className="page-actions">
-          <span className="fortigate-count"><b>{firewalls.length}</b><span>firewalls cadastrados</span></span>
+          <span className="fortigate-count"><b>{firewalls.length}</b><span>{firewalls.length === 1 ? 'firewall' : 'firewalls'}</span></span>
           <button className="ghost" onClick={() => loadFirewalls()} disabled={loading} aria-label="Atualizar lista">↻ Atualizar</button>
+          <button onClick={openNewForm}>{formOpen && !editingId ? 'Fechar' : '+ Adicionar firewall'}</button>
         </div>
       </div>
-      <div className="page-body fortigate-body">
-        {error && <p className="error">{error}</p>}
-        {message && <p className="hint">{message}</p>}
-        <section className="inventory-add-panel fortigate-add-panel">
-          <div className="inventory-add-heading">
+
+      {error && <p className="error">{error}</p>}
+      {message && <p className="fgt-flash">{message}</p>}
+
+      {(formOpen || (!loading && !firewalls.length)) && (
+        <section className="fgt-card fgt-form-panel">
+          <div className="fgt-form-heading">
             <span className="fortigate-step">{editingId ? 'CONFIGURAÇÃO' : 'NOVO EQUIPAMENTO'}</span>
             <h3>{editingId ? `Editar ${form.name || 'FortiGate'}` : 'Adicionar firewall'}</h3>
-            <p className="hint">Credenciais protegidas com AES-256-GCM. O token não é mostrado após salvar.</p>
+            <p className="hint">Token protegido com AES-256-GCM e nunca exibido após salvar.</p>
           </div>
-          <form className="cmp-form inventory-create-form" onSubmit={saveFirewall}>
+          <form className="fgt-form" onSubmit={saveFirewall}>
             <label className="fortigate-field"><span>Nome de identificação</span><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex.: FGT-Matriz" required /></label>
             <label className="fortigate-field"><span>Endereço do equipamento</span><input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="IP ou hostname" required /></label>
             <label className="fortigate-field"><span>{editingId ? 'Substituir token (opcional)' : 'Token de API'}</span><input className="input" type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Deixe vazio para manter o atual' : 'Token API'} required={!editingId} autoComplete="new-password" /></label>
-            <button className="fortigate-submit" type="submit" disabled={busy === 'save'}>{busy === 'save' ? 'Salvando…' : editingId ? 'Salvar alterações' : 'Cadastrar'}</button>
-            {editingId && <button type="button" className="ghost" onClick={resetForm}>Cancelar</button>}
+            <div className="fgt-form-actions">
+              {(formOpen || editingId) && <button type="button" className="ghost" onClick={resetForm}>Cancelar</button>}
+              <button type="submit" disabled={busy === 'save'}>{busy === 'save' ? 'Salvando…' : editingId ? 'Salvar alterações' : 'Cadastrar'}</button>
+            </div>
           </form>
         </section>
-        {loading && <p className="hint">Carregando firewalls…</p>}
-        {!loading && !firewalls.length && <p className="empty">Nenhum FortiGate cadastrado.</p>}
-        {!!firewalls.length && (
-          <div className="inventory-workspace fortigate-workspace">
-            <section className="inventory-machine-panel fortigate-list-panel">
-              <div className="inventory-panel-head"><div><h3>Equipamentos</h3><span className="hint">Selecione um firewall para ver as políticas</span></div><span className="badge low">{firewalls.length}</span></div>
-              <div className="inventory-machine-list fortigate-list">
-                {firewalls.map((firewall) => (
-                  <article key={firewall.id} className={`fortigate-card${selectedId === firewall.id ? ' active' : ''}`} onClick={() => setSelectedId(firewall.id)}>
-                    <div className="fortigate-card-head">
-                      <span className="fortigate-device-icon" aria-hidden="true">▣</span>
-                      <div className="fortigate-device-info"><b>{firewall.name}</b><span className="mono">{firewall.host}</span></div>
-                      <span className="fortigate-vdom">{firewall.vdom || 'root'}</span>
+      )}
+
+      {loading && !firewalls.length && <p className="hint">Carregando firewalls…</p>}
+
+      {!!firewalls.length && (
+        <>
+          <section className="fgt-devices" aria-label="Equipamentos">
+            {firewalls.map((firewall) => {
+              const active = selectedId === firewall.id;
+              return (
+                <article key={firewall.id} className={`fgt-device${active ? ' active' : ''}`} onClick={() => setSelectedId(firewall.id)}>
+                  <div className="fgt-device-top">
+                    <span className="fortigate-device-icon" aria-hidden="true">▣</span>
+                    <div className="fgt-device-info">
+                      <b>{firewall.name}</b>
+                      <span className="mono">{firewall.host}</span>
                     </div>
-                    <div className="fortigate-card-meta"><span><i className={`fortigate-token-dot${firewall.hasToken ? ' on' : ''}`} />{firewall.hasToken ? 'Token configurado' : 'Token ausente'}</span><span>ID {firewall.id}</span></div>
-                    <div className="fortigate-card-actions" onClick={(e) => e.stopPropagation()}>
-                      <button className="fortigate-analyze-button" onClick={() => runAnalysis(firewall)} disabled={analysisLoading}>{analysisLoading && analysisTarget?.id === firewall.id ? 'Analisando…' : 'Análise inteligente'}</button>
+                    <span className="fortigate-vdom">VDOM {firewall.vdom || 'root'}</span>
+                  </div>
+                  <div className="fgt-device-bottom">
+                    <span className="fgt-device-token"><i className={`fortigate-token-dot${firewall.hasToken ? ' on' : ''}`} />{firewall.hasToken ? 'Token OK' : 'Sem token'}</span>
+                    <div className="fgt-device-actions" onClick={(e) => e.stopPropagation()}>
+                      <button className="fgt-btn-accent" onClick={() => runAnalysis(firewall)} disabled={analysisLoading}>{analysisLoading && analysisTarget?.id === firewall.id ? 'Analisando…' : 'Análise'}</button>
                       <button className="ghost" onClick={() => runTest(firewall)} disabled={busy === `test-${firewall.id}`}>{busy === `test-${firewall.id}` ? 'Testando…' : 'Testar'}</button>
-                      <button className="ghost" onClick={() => { setEditingId(firewall.id); setForm({ name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root', token: '' }); }}>Editar</button>
-                      <button className="ghost fortigate-remove-button" onClick={() => removeFirewall(firewall)} disabled={busy === `delete-${firewall.id}`}>Remover</button>
+                      <button className="ghost" onClick={() => openEditForm(firewall)}>Editar</button>
+                      <button className="ghost fgt-btn-danger" onClick={() => removeFirewall(firewall)} disabled={busy === `delete-${firewall.id}`} title="Remover">Remover</button>
                     </div>
-                  </article>
-                ))}
-              </div>
-            </section>
-            <section className="inventory-machine-panel fortigate-policies">
-              <div className="dashboard-section-head">
-                <div><h3>{selected?.name || 'Políticas'}</h3><span className="hint">{selected?.host || ''} · VDOM {selected?.vdom || 'root'}</span></div>
-                <div className="page-actions">
-                  <label className="dashboard-period-select"><span>Ordenar</span><select value={sort} onChange={(e) => { setSort(e.target.value); setOffset(0); }}><option value="hits">Hits</option><option value="bytes">Bytes</option><option value="packets">Pacotes</option><option value="sessions">Sessões</option></select></label>
-                </div>
-              </div>
-              <p className="hint">Hits, bytes e pacotes são os contadores atuais retornados pelo FortiGate; primeira e última utilização são os timestamps informados pelo próprio equipamento.</p>
-              {policyError && <p className="error">{policyError}</p>}
-              {policyLoading ? <p className="hint">Consultando políticas no FortiGate…</p> : !selected ? <p className="hint">Selecione um firewall.</p> : !policiesData ? <p className="hint">Sem dados de política.</p> : (
-                <>
-                  <div className="table-wrap">
-                    <table className="dashboard-data-table">
-                      <thead><tr><th>Política</th><th>Posição</th><th>Hits</th><th>Bytes</th><th>Pacotes</th><th>Sessões</th><th>Primeiro uso</th><th>Último uso</th></tr></thead>
-                      <tbody>{(policiesData.policies || []).map((policy) => (
-                        <tr key={policy.policyid} className="fgt-policy-row" onClick={() => showPolicy(policy.policyid)}>
-                          <td><b>{policy.name || `Policy ${policy.policyid}`}</b><small>{policy.policyid}</small></td>
-                          <td>{policy.position ?? '—'}</td><td>{policy.hitCount ?? 0}</td><td>{fmtBytes(policy.bytes || 0)}</td><td>{policy.packets ?? 0}</td><td>{policy.activeSessions ?? policy.sessionCount ?? 0}</td>
-                          <td>{dateValue(policy.firstUsed)}</td><td>{dateValue(policy.lastUsed)}</td>
-                        </tr>
-                      ))}</tbody>
-                    </table>
                   </div>
-                  <div className="pager">
-                    <span>{policiesData.total ?? 0} políticas · página {policiesData.page ?? 1} de {policiesData.pages ?? 1}</span>
-                    <button className="ghost" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - 20))}>Anterior</button>
-                    <button className="ghost" disabled={offset + 20 >= (policiesData.total || 0)} onClick={() => setOffset(offset + 20)}>Próxima</button>
-                  </div>
-                </>
-              )}
-            </section>
-          </div>
-        )}
-      </div>
+                </article>
+              );
+            })}
+          </section>
+          <section className="fgt-card fortigate-policies">
+            <FortigatePolicyTable firewall={selected} onOpenPolicy={(policyId) => showPolicy(policyId)} />
+          </section>
+        </>
+      )}
+      {analysisTarget && (
+        <FortigateAnalysis
+          target={analysisTarget}
+          analysis={analysis}
+          loading={analysisLoading}
+          error={analysisError}
+          staleDays={staleDays}
+          onChangeStaleDays={(days) => { setStaleDays(days); runAnalysis(analysisTarget, days); }}
+          onRerun={() => runAnalysis(analysisTarget)}
+          onClose={closeAnalysis}
+          onOpenPolicy={(policyId) => showPolicy(policyId, analysisTarget.id, analysisTarget.vdom)}
+        />
+      )}
       {detail && (
         <div className="modal-backdrop" onClick={() => setDetail(null)}>
           <div className="modal modal-wide fgt-detail" onClick={(e) => e.stopPropagation()}>
@@ -347,43 +423,10 @@ function FortigatePage() {
                 ];
                 return <>{sections.map(([title, values]) => (
                   <section className="fgt-sec" key={title}><h4>{title}</h4><div className="fgt-g">{Object.entries(values || {}).filter(([, value]) => value != null && value !== '').map(([key, value]) => (
-                    <div className="fgt-kv" key={key}><span>{key}</span><b className="mono">{detailValue(value)}</b></div>
+                    <div className="fgt-kv" key={key}><span>{key}</span><b className={`mono${key === 'srcintf' || key === 'dstintf' ? ' fgt-upper' : ''}`}>{detailValue(value)}</b></div>
                   ))}</div></section>
                 ))}{policy.advanced?.length > 0 && <section className="fgt-sec fgt-adv"><h4>Campos avançados</h4><div className="fgt-g">{policy.advanced.map((item) => <div className="fgt-kv" key={item.key}><span>{item.key}</span><b className="mono">{item.value}</b></div>)}</div></section>}</>;
               })()}
-            </div>
-          </div>
-        </div>
-      )}
-      {(analysis || analysisError) && (
-        <div className="modal-backdrop" onClick={closeAnalysis}>
-          <div className="modal modal-wide fgt-analysis" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head"><div><h2>Análise inteligente · {analysisTarget?.name}</h2><span className="hint">{analysisTarget?.host} · VDOM {analysisTarget?.vdom} · análise somente leitura</span></div><button className="ghost" onClick={closeAnalysis}>✕</button></div>
-            <div className="modal-body">
-              <div className="fgt-an-toolbar"><label className="field"><span>Inatividade para regra obsoleta</span><select value={staleDays} onChange={(e) => setStaleDays(Number(e.target.value))}><option value={30}>30 dias</option><option value={60}>60 dias</option><option value={90}>90 dias</option><option value={180}>180 dias</option></select></label><label className="field"><span>Severidade</span><select value={analysisSeverity} onChange={(e) => setAnalysisSeverity(e.target.value)}><option value="todas">Todas</option><option value="alta">Alta</option><option value="media">Média</option><option value="baixa">Baixa</option></select></label><button className="ghost" onClick={() => runAnalysis(analysisTarget)} disabled={analysisLoading}>Recalcular</button></div>
-              {analysisError && <p className="error">{analysisError}</p>}
-              {analysis?.loading && <p className="hint">Analisando configuração e uso…</p>}
-              {analysis?.summary && <div className="fgt-an-summary"><span className="badge low">{analysis.summary.totalPolicies} políticas</span><span className="badge low">{analysis.summary.policiesWithStats} com estatística</span><span className="badge med">{analysis.summary.findings} achados</span></div>}
-              {!!analysis?.findings?.length && <div className="fgt-an-list">{shownFindings.map((finding, index) => {
-                const findingId = finding.id || `${finding.rule}-${finding.policyid}-${index}`;
-                const expanded = expandedFindingId === findingId;
-                return (
-                <article className="inventory-machine-row" key={findingId} onClick={() => setExpandedFindingId(expanded ? null : findingId)}>
-                  <i className={`fgt-an-sev ${findingClass(finding.severity)}`} />
-                  <div className="fgt-an-title"><b>{finding.category || finding.rule}</b><small>{finding.policyName || `Policy ${finding.policyid}`} · posição {finding.position || '—'} · {finding.rule}</small><p className="hint">{finding.problem}</p>
-                    {expanded && <div className="fgt-an-block">
-                      <h5>Recomendação</h5><p>{finding.recommendation}</p>
-                      <div className="fgt-an-badges"><span className="badge low">Impacto: {finding.impact}</span><span className="badge med">Risco da mudança: {finding.changeRisk}</span></div>
-                      {!!finding.evidence?.length && <><h5>Evidências</h5><ul>{finding.evidence.map((line, i) => <li key={i}>{line}</li>)}</ul></>}
-                      {finding.validation && <div className="fgt-an-validate"><h5>Validar antes de mudar</h5><p>{finding.validation}</p></div>}
-                      <button className="ghost" onClick={(event) => { event.stopPropagation(); closeAnalysis(); showPolicy(finding.policyid, analysisTarget?.id, analysisTarget?.vdom); }}>Ver política</button>
-                    </div>}
-                  </div>
-                  <div className="fgt-an-badges"><span className={`badge ${findingClass(finding.severity)}`}>{severityLabel(finding.severity)}</span>{finding.confidence && <span className="badge low">Confiança: {finding.confidence}</span>}<span className="fgt-an-caret">{expanded ? '▾' : '▸'}</span></div>
-                </article>
-              );})}</div>}
-              {!analysis?.loading && !analysisError && analysis && !shownFindings.length && <p className="hint">Nenhum achado para este filtro com os dados disponíveis.</p>}
-              {!!analysis?.limitations?.length && <details className="howto"><summary>Limitações da análise</summary><ul>{analysis.limitations.map((item, index) => <li key={index}>{item}</li>)}</ul></details>}
             </div>
           </div>
         </div>
@@ -416,13 +459,27 @@ export default function App() {
   const [minBytes, setMinBytes] = useState(0);
   const [protoFilter, setProtoFilter] = useState('ALL');
   const [search, setSearch] = useState('');
-  const [spacing, setSpacing] = useState(420);
-  const [layoutName, setLayoutName] = useState('cose');
-  const [showPorts, setShowPorts] = useState(true);
+  const [spacing, setSpacing] = usePersistentState('map.spacing', 420);
+  const [layoutName, setLayoutName] = usePersistentState('map.layout', 'cose');
+  const [showPorts, setShowPorts] = usePersistentState('map.showPorts', true);
   const [view, setView] = useState('hosts'); // hosts | subnets
-  const [showNames, setShowNames] = useState(true);
+  const [showNames, setShowNames] = usePersistentState('map.showNames', true);
+  // Filtros extras do mapa
+  const [portFilter, setPortFilter] = useState(''); // '' = todas as portas
+  const [trafficFilter, setTrafficFilter] = useState('all'); // all | internal | external | inbound | outbound
+  const [minFlows, setMinFlows] = useState(1);
+  // Destaque de IPs públicos com reputação ruim
+  const [highlightRisk, setHighlightRisk] = usePersistentState('map.highlightRisk', false);
+  // Atualização automática (segundos; 0 = desligada)
+  const [autoRefresh, setAutoRefresh] = usePersistentState('map.autoRefresh', 0);
+  // Painéis do mapa
+  const [legendOpen, setLegendOpen] = usePersistentState('map.legendOpen', true);
+  const [collapsedCards, setCollapsedCards] = usePersistentState('map.collapsedCards', {});
+  const [mapNotice, setMapNotice] = useState('');
+  const [riskCount, setRiskCount] = useState(null); // IPs destacados pelo filtro de risco
+  const pendingSelectRef = useRef(null); // IP buscado que ainda não estava no mapa
   const [focusSubnet, setFocusSubnet] = useState(null);
-  const [fgTab, setFgTab] = useState('firewalls'); // firewalls | backups
+  const [fgTab, setFgTab] = useState('firewalls'); // firewalls | backups | audit
   const [focusHost, setFocusHost] = useState(null); // mapa mostra só este host + vizinhos
   const [subnetEmpty, setSubnetEmpty] = useState(''); // sub-rede escolhida sem tráfego na janela
   const [repMap, setRepMap] = useState({});
@@ -431,9 +488,24 @@ export default function App() {
   const [repCov, setRepCov] = useState({});
   const [repMsg, setRepMsg] = useState(null);
   const [repQuota, setRepQuota] = useState(null);
-const [perfMode, setPerfMode] = useState(false);
+  const [perfMode, setPerfMode] = useState(false);
+  // Quantas arestas (maior volume primeiro) o backend devolve para desenhar.
+  const [edgeLimit, setEdgeLimit] = useState(() => {
+    const saved = Number.parseInt(localStorage.getItem('map.edgeLimit') ?? '', 10);
+    return Number.isInteger(saved) && saved >= 0 ? saved : 3000; // 0 = máximo do backend
+  });
+  // Renderizador WebGL do Cytoscape (experimental, bem mais rápido em grafo grande).
+  const [useWebgl, setUseWebgl] = useState(() => localStorage.getItem('map.webgl') === '1');
+  const [layoutNote, setLayoutNote] = useState(''); // aviso quando o layout de força é trocado
+  const loadReqRef = useRef(0);
+  const focusFirstRunRef = useRef(true);
+  // Foco atual sempre fresco para o load() (closures de efeitos ficam velhas).
+  const focusRef = useRef({ subnet: null, host: null });
+  focusRef.current = { subnet: focusSubnet, host: focusHost };
+  const minBytesD = useDebounced(minBytes, 350);
+  const spacingD = useDebounced(spacing, 350);
   const [tip, setTip] = useState(null); // tooltip do mapa: { x, y, flip, title, badge, rows }
-  const [isolate, setIsolate] = useState(true); // apagar o resto ao selecionar um host
+  const [isolate, setIsolate] = usePersistentState('map.isolate', true); // apagar o resto ao selecionar um host
   const [ipModal, setIpModal] = useState(null); // { loading, ip } | dossiê | { ip, error }
   const [cmpOpen, setCmpOpen] = useState(false);
   const [pairsOpen, setPairsOpen] = useState(false);
@@ -1151,11 +1223,14 @@ async function checkRep(ips) {
   finally { setRepLoading(false); }
 }
 
-  const publicIps = [...new Set(graph.nodes.map((n) => n.data.id))].filter(isPublicIp);
-  const publicIpsKey = publicIps.join('|');
-  const inventoryNames = Object.fromEntries(inventoryData.flatMap((server) =>
+  // Memorizados: o App re-renderiza a cada hover do mapa (tooltip), e com
+  // milhares de nós recalcular isso a cada render pesava.
+  const publicIps = useMemo(() => [...new Set(graph.nodes.map((n) => n.data.id))].filter(isPublicIp), [graph]);
+  const publicIpsKey = useMemo(() => publicIps.join('|'), [publicIps]);
+  const inventoryNames = useMemo(() => Object.fromEntries(inventoryData.flatMap((server) =>
     (server.ips || []).map((item) => [item.ip, server.name])
-  ));
+  )), [inventoryData]);
+  const maxEdgeBytes = useMemo(() => maxOf(graph.edges, (e) => e.data.bytes), [graph]);
 
   useEffect(() => {
     const missingCoverage = publicIps.filter((ip) => !repCov[ip]);
@@ -1203,11 +1278,12 @@ async function checkRep(ips) {
       : { minutes };
   }
 
-  function buildLayout(fast = false) {
+  function buildLayout(fast = false, name = layoutName) {
+    const spacing = spacingD;
     const noAnim = fast ? { animate: false, animationDuration: 0 } : { animate: true, animationDuration: 600 };
-    if (layoutName === 'circle') return { name: 'circle', padding: 60, ...noAnim };
-    if (layoutName === 'grid') return { name: 'grid', padding: 60, ...noAnim };
-    if (layoutName === 'concentric') {
+    if (name === 'circle') return { name: 'circle', padding: 60, ...noAnim };
+    if (name === 'grid') return { name: 'grid', padding: 60, ...noAnim };
+    if (name === 'concentric') {
       return {
         name: 'concentric', padding: 60, ...noAnim,
         concentric: (n) => n.degree(), levelWidth: () => 2, minNodeSpacing: spacing / 2
@@ -1220,7 +1296,7 @@ async function checkRep(ips) {
       idealEdgeLength: () => spacing,
       nodeOverlap: 90,
       nodeRepulsion: () => 30000 + spacing * 150,
-      nodeDimensionsIncludeLabels: true,
+      nodeDimensionsIncludeLabels: !fast,
       componentSpacing: spacing,
       edgeElasticity: 80,
       nestingFactor: 1.2,
@@ -1231,26 +1307,61 @@ async function checkRep(ips) {
     };
   }
 
-  async function load() {
+  // `fresh` ignora o cache do backend (botão Atualizar). Focar sub-rede/host
+  // pede o recorte ao backend: assim o top-N é calculado DENTRO do foco e não
+  // some nada que ficou fora das N maiores conexões da rede inteira.
+  async function load({ fresh = false, limit = edgeLimit, keepSelection = false } = {}) {
+    const requestId = loadReqRef.current + 1;
+    loadReqRef.current = requestId;
+    loadReqRef.inFlight = true;
+    const scope = { ip: focusRef.current.host || null, cidr: focusRef.current.host ? null : focusRef.current.subnet || null };
     setLoading(true);
     setError('');
     try {
       const params = useCustom && custom.from && custom.to
         ? { from: new Date(custom.from).toISOString(), to: new Date(custom.to).toISOString() }
         : { minutes };
-      const data = await fetchGraph(params);
+      const data = await fetchGraph({ ...params, limit, fresh, ...scope });
+      // Uma carga mais nova já saiu: descarta esta (evita o mapa "voltar" para dados velhos).
+      if (loadReqRef.current !== requestId) return;
       setGraph(data);
-      setSelected(null);
-      setHostDetail(null);
-      setEdgeInfo(null);
+      if (!keepSelection) {
+        setSelected(null);
+        setHostDetail(null);
+        setEdgeInfo(null);
+      }
+      // O foco mudou enquanto a carga rodava (ex.: sub-rede padrão chegando
+      // no 1º acesso) e o resultado veio cortado: pede de novo já recortado.
+      const now = { ip: focusRef.current.host || null, cidr: focusRef.current.host ? null : focusRef.current.subnet || null };
+      if (data.meta?.limited && (now.ip !== scope.ip || now.cidr !== scope.cidr)) load({ limit, keepSelection: true });
     } catch (e) {
+      if (loadReqRef.current !== requestId) return;
       setError('Falha ao carregar grafo. Verifique se o backend (porta 3001) e o Elasticsearch estão no ar. ' + e.message);
     } finally {
-      setLoading(false);
+      if (loadReqRef.current === requestId) { setLoading(false); loadReqRef.inFlight = false; }
     }
   }
 
   useEffect(() => { load(); loadWatch(); }, []); // eslint-disable-line
+
+  // Foco mudou: só recarrega se o recorte importa (resultado limitado ou
+  // carga anterior já recortada). Sem limite, o filtro local basta.
+  useEffect(() => {
+    if (focusFirstRunRef.current) { focusFirstRunRef.current = false; return; }
+    const meta = graph.meta || {};
+    if (meta.limited || meta.scope?.cidr || meta.scope?.ip) load({ keepSelection: true });
+  }, [focusSubnet, focusHost]); // eslint-disable-line
+
+  function changeEdgeLimit(value) {
+    setEdgeLimit(value);
+    localStorage.setItem('map.edgeLimit', String(value));
+    load({ limit: value });
+  }
+
+  function changeWebgl(on) {
+    setUseWebgl(on);
+    localStorage.setItem('map.webgl', on ? '1' : '0');
+  }
 
   function underlineMapLabel(text) {
     return Array.from(String(text)).map((character) => /\s/.test(character) ? character : `${character}\u0332`).join('');
@@ -1300,18 +1411,39 @@ async function checkRep(ips) {
   }
 
   // Isola o 1º nível do host selecionado, sem reconstruir o grafo
+  // Também aplica o destaque de risco quando não há host isolado: IPs públicos
+  // com reputação ruim + seus vizinhos ficam acesos, o resto esmaece.
   function applyIsolate() {
     const c = cy.current;
     if (!c) return;
-    c.elements().removeClass('unfocused');
-    if (!isolate || !selected) return;
-    const n = c.getElementById(selected);
-    if (!n.length) return;
-    const keep = new Set([n.id()]);
-    n.connectedEdges().forEach((e) => { keep.add(e.data('source')); keep.add(e.data('target')); });
-    c.nodes().forEach((x) => { if (!keep.has(x.id())) x.addClass('unfocused'); });
-    c.edges().forEach((x) => {
-      if (!keep.has(x.data('source')) || !keep.has(x.data('target'))) x.addClass('unfocused');
+    c.batch(() => {
+      c.elements().removeClass('unfocused risky');
+      const rep = uiRef.current.repMap || {};
+      let risky = 0;
+      if (highlightRisk) {
+        c.nodes().forEach((x) => { if (!x.data('isSubnet') && isPublicIp(x.id()) && isRiskyRep(rep[x.id()])) { x.addClass('risky'); risky += 1; } });
+      }
+      setRiskCount(highlightRisk ? risky : null);
+
+      let keep = null;
+      if (isolate && selected) {
+        const n = c.getElementById(selected);
+        if (n.length) {
+          keep = new Set([n.id()]);
+          n.connectedEdges().forEach((e) => { keep.add(e.data('source')); keep.add(e.data('target')); });
+        }
+      } else if (highlightRisk && risky) {
+        keep = new Set();
+        c.nodes('.risky').forEach((n) => {
+          keep.add(n.id());
+          n.connectedEdges().forEach((e) => { keep.add(e.data('source')); keep.add(e.data('target')); });
+        });
+      }
+      if (!keep) return;
+      c.nodes().forEach((x) => { if (!keep.has(x.id())) x.addClass('unfocused'); });
+      c.edges().forEach((x) => {
+        if (!keep.has(x.data('source')) || !keep.has(x.data('target'))) x.addClass('unfocused');
+      });
     });
   }
 
@@ -1393,24 +1525,38 @@ if (cy.current) {
       cy.current = null;
     }
 
-    const maxBytes = Math.max(1, ...graph.edges.map((e) => e.data.bytes || 0));
+    // Sem spread em Math.max: com dezenas de milhares de arestas o spread
+    // estoura a pilha de argumentos do navegador.
+    const maxBytes = Math.max(1, maxEdgeBytes);
+    const portWanted = portFilter === '' ? null : Number(portFilter);
     let filteredEdges = graph.edges.filter((e) => {
-      if ((e.data.bytes || 0) < minBytes) return false;
-      if (protoFilter !== 'ALL' && e.data.protocol !== protoFilter) return false;
+      const d = e.data;
+      if ((d.bytes || 0) < minBytesD) return false;
+      if ((d.flows || 0) < minFlows) return false;
+      if (protoFilter !== 'ALL' && d.protocol !== protoFilter) return false;
+      if (portWanted != null && d.dstPort !== portWanted && !(d.dstPorts || []).some((p) => p.port === portWanted)) return false;
+      if (trafficFilter !== 'all') {
+        const srcPub = isPublicIp(d.source);
+        const dstPub = isPublicIp(d.target);
+        if (trafficFilter === 'internal' && (srcPub || dstPub)) return false;
+        if (trafficFilter === 'external' && srcPub === dstPub) return false;
+        if (trafficFilter === 'inbound' && !(srcPub && !dstPub)) return false;
+        if (trafficFilter === 'outbound' && !(!srcPub && dstPub)) return false;
+      }
       return true;
     });
-let filteredNodes = graph.nodes.filter((n) =>
-      filteredEdges.some((e) => e.data.source === n.data.id || e.data.target === n.data.id)
-    );
 
-    // Volume por nó (bytes das arestas incidentes) p/ dimensionar os nós
+    // Volume por nó (bytes das arestas incidentes) p/ dimensionar os nós.
+    // O mesmo Map diz quais nós têm aresta: antes era um filter com some()
+    // por nó (nós × arestas), que travava a aba com grafo grande.
     const nodeBytes = new Map();
     for (const e of filteredEdges) {
       const b = e.data.bytes || 0;
       nodeBytes.set(e.data.source, (nodeBytes.get(e.data.source) || 0) + b);
       nodeBytes.set(e.data.target, (nodeBytes.get(e.data.target) || 0) + b);
     }
-    volRef.current = { max: Math.max(1, ...nodeBytes.values()) };
+    let filteredNodes = graph.nodes.filter((n) => nodeBytes.has(n.data.id));
+    volRef.current = { max: Math.max(1, maxOf(nodeBytes.values(), (v) => v)) };
 
     // Drill-down: sub-rede/CIDR em foco + vizinhos, ou host em foco + vizinhos
     if (focusHost) {
@@ -1436,29 +1582,44 @@ let filteredNodes = graph.nodes.filter((n) =>
       setSubnetEmpty('');
     }
 
+    // Largura/cor da aresta calculadas uma vez aqui e lidas via data(): função
+    // no estilo é reavaliada por elemento a cada update de estilo.
+    const styleEdge = (e) => ({ ...e, data: { ...e.data, _w: widthFor(e.data.bytes, maxBytes), _c: colorFor(e.data.protocol) } });
     let elements;
+    let nodeCount;
     let isSubnetView = view === 'subnets' && !focusSubnet && !focusHost;
 if (isSubnetView) {
       const { snodes, sedges } = aggregateSubnets(filteredNodes, filteredEdges);
-      elements = [...snodes, ...sedges];
+      elements = [...snodes, ...sedges.map(styleEdge)];
+      nodeCount = snodes.length;
     } else {
       // copia os nós para poder gravar o volume sem mutar o estado do grafo
       const withVol = filteredNodes.map((n) => ({ ...n, data: { ...n.data, bytes: nodeBytes.get(n.data.id) || 0 } }));
-      elements = [...withVol, ...filteredEdges];
+      elements = [...withVol, ...filteredEdges.map(styleEdge)];
+      nodeCount = withVol.length;
     }
 
     // Grafos grandes (>1200 elementos) travam a aba com animação/texturas:
-    // liga o modo desempenho automaticamente
+    // liga o modo desempenho automaticamente. Muito grandes: desenho enxuto.
     const fast = elements.length > 1200;
+    const huge = elements.length > HUGE_ELEMENTS;
     setPerfMode(fast);
+    // Força (cose) é O(n²) por iteração: acima do teto vira concêntrico.
+    const effectiveLayout = layoutName === 'cose' && nodeCount > COSE_MAX_NODES ? 'concentric' : layoutName;
+    setLayoutNote(effectiveLayout !== layoutName
+      ? `Layout de força desativado acima de ${COSE_MAX_NODES.toLocaleString('pt-BR')} nós (${nodeCount.toLocaleString('pt-BR')} na tela): usando concêntrico.`
+      : '');
+    const layoutOf = (opts = {}) => ({ ...buildLayout(fast, effectiveLayout), ...opts });
 
     cy.current = cytoscape({
       container: cyRef.current,
       elements,
       layout: { name: 'preset' }, // sem animação automática; física decidida abaixo
-      textureOnViewport: fast,
-      motionBlur: fast,
-      hideEdgesOnViewport: false,
+      webgl: useWebgl,
+      textureOnViewport: fast && !useWebgl,
+      motionBlur: fast && !useWebgl,
+      hideEdgesOnViewport: huge && !useWebgl,
+      pixelRatio: huge && !useWebgl ? 1 : undefined,
       style: [
         {
           selector: 'node',
@@ -1472,6 +1633,9 @@ if (isSubnetView) {
 label: (el) => el.data('isSubnet') ? el.data('label') : nodeLabel(el.id()),
             color: '#334155',
             'font-size': (el) => (el.data('isSubnet') ? 10 : 9) + Math.round(nodeScale(el) * 3),
+            // Texto só aparece com zoom suficiente: desenhar milhares de
+            // rótulos ilegíveis no zoom-out é o que mais custa por frame.
+            'min-zoomed-font-size': huge ? 9 : fast ? 6 : 0,
             'text-valign': 'bottom',
             'text-margin-y': 6,
             'text-wrap': 'wrap',
@@ -1493,18 +1657,23 @@ selector: 'node:selected',
         {
           selector: 'edge',
           style: {
-            width: (el) => widthFor(el.data('bytes'), maxBytes),
-            'line-color': (el) => colorFor(el.data('protocol')),
-            'target-arrow-color': (el) => colorFor(el.data('protocol')),
-            'target-arrow-shape': 'triangle',
+            width: 'data(_w)',
+            'line-color': 'data(_c)',
+            'target-arrow-color': 'data(_c)',
+            // Grafo muito grande: linha reta (haystack) sem seta é várias vezes
+            // mais barata que bezier com seta.
+            'target-arrow-shape': huge ? 'none' : 'triangle',
             'arrow-scale': 0.7,
-            'curve-style': 'bezier',
+            'curve-style': huge ? 'haystack' : 'bezier',
+            'haystack-radius': 0,
             opacity: 0.7,
             // rótulo origem→destino em cada conexão (desligável p/ limpar o mapa)
             label: (el) => {
-              if (!uiRef.current.showPorts) return '';
+              if (huge || !uiRef.current.showPorts) return '';
               return el.data('portLabel') || `${el.data('srcPort') ?? '?'}→${el.data('dstPort') ?? el.data('port') ?? '?'}`;
-            },            'font-size': 7,
+            },
+            'min-zoomed-font-size': fast ? 10 : 0,
+            'font-size': 7,
             color: '#64748b',
             'text-rotation': 'autorotate',
             'text-margin-y': -6
@@ -1513,6 +1682,11 @@ selector: 'node:selected',
 {
           selector: 'edge:selected',
           style: { opacity: 1, 'font-size': 9, color: '#fff' }
+        },
+        // Destaque de risco: anel vermelho nos IPs públicos com reputação ruim
+        {
+          selector: 'node.risky',
+          style: { 'border-width': 4, 'border-color': '#b91c1c', 'border-opacity': 1 }
         },
         // Isolamento: o que não é vizinho do host selecionado some
         {
@@ -1535,13 +1709,13 @@ selector: 'node:selected',
       if (n.length) { n.position(p); restored++; }
     });
 if (restored > 0) {
-      cyInst.layout({ ...buildLayout(fast), randomize: false, animate: false }).run();
+      cyInst.layout(layoutOf({ randomize: false, animate: false })).run();
       if (savedView) { try { cyInst.viewport({ zoom: savedView.zoom, pan: savedView.pan }); } catch { /* ignore */ } }
     } else {
       // Conteúdo novo: layout SEM animação (ver comentário do destroy) e
       // enquadramento depois que a física termina.
       cyInst.one('layoutstop', () => { try { cyInst.fit(undefined, 40); } catch { /* ignore */ } });
-      cyInst.layout({ ...buildLayout(fast), animate: false }).run();
+      cyInst.layout(layoutOf({ animate: false })).run();
     }
 
     cy.current.on('tap', 'node', async (evt) => {
@@ -1636,7 +1810,7 @@ cy.current.on('tap', (evt) => {
         try {
           cyInst.resize();
           // posições nasceram contra uma caixa 0x0: refaz a física e enquadra
-          cyInst.layout({ ...buildLayout(fast), randomize: true, animate: false }).run();
+          cyInst.layout(layoutOf({ randomize: true, animate: false })).run();
           cyInst.fit(undefined, 40);
         } catch { /* ignore */ }
         ro2.disconnect();
@@ -1664,7 +1838,7 @@ cy.current.on('tap', (evt) => {
           console.warn('[mapa] posições inválidas — refazendo a física', {
             visivel, pilhado, elementos: elements.length, ext, vp
           });
-          cyInst.layout({ ...buildLayout(fast), randomize: true, animate: false }).run();
+          cyInst.layout(layoutOf({ randomize: true, animate: false })).run();
           cyInst.fit(undefined, 40);
         }
       } catch (e) { console.warn('[mapa] falha ao corrigir o viewport', e); }
@@ -1678,7 +1852,28 @@ cy.current.on('tap', (evt) => {
     cyInst.container().addEventListener('mouseleave', hideTip, { signal: tipAbortRef.current.signal });
 
     applyIsolate();
-  }, [graph, minBytes, protoFilter, spacing, layoutName, view, focusSubnet, focusHost]); // eslint-disable-line
+
+    // IP buscado que não estava no mapa: só decide quando o grafo já é o
+    // recorte certo (sem limite, ou recortado pelo próprio IP no backend).
+    const pending = pendingSelectRef.current;
+    if (pending && !isSubnetView) {
+      const scopeOk = !graph.meta?.limited || graph.meta?.scope?.ip === pending;
+      if (scopeOk) {
+        pendingSelectRef.current = null;
+        const node = cyInst.getElementById(pending);
+        if (node.length) {
+          cyInst.one('layoutstop', () => { try { cyInst.center(node); } catch { /* ignore */ } });
+          node.select();
+          setSelected(pending);
+          setEdgeInfo(null);
+          reloadHost(pending);
+        } else {
+          setFocusHost(null);
+          setMapNotice(`IP ${pending} não tem tráfego nesta janela (com os filtros atuais).`);
+        }
+      }
+    }
+  }, [graph, minBytesD, protoFilter, portFilter, trafficFilter, minFlows, spacingD, layoutName, view, focusSubnet, focusHost, useWebgl]); // eslint-disable-line
 
   // Cosmético (nomes resolvidos, rótulos de porta, reputação): só reavalia
   // estilos, sem destruir o grafo — o mapa fica parado
@@ -1687,12 +1882,17 @@ cy.current.on('tap', (evt) => {
     if (cy.current) cy.current.style().update();
   }, [showNames, inventoryData, showPorts, repMap]);
 
-  // Reaplica o isolamento quando a seleção muda (o grafo não é reconstruído)
-  useEffect(() => { applyIsolate(); }, [selected, isolate]);
+  // Reaplica isolamento/destaque quando seleção, opção ou reputação mudam (sem reconstruir o grafo)
+  useEffect(() => { applyIsolate(); }, [selected, isolate, highlightRisk, repMap]); // eslint-disable-line
 
   function relayout() {
     // Reorganizar é explícito: física completa com animação
-    cy.current?.layout({ ...buildLayout(perfMode), randomize: true, animate: true }).run();
+    const c = cy.current;
+    if (!c) return;
+    // Mesmo teto do efeito: força com milhares de nós congela a aba.
+    const name = layoutName === 'cose' && c.nodes().length > COSE_MAX_NODES ? 'concentric' : layoutName;
+    const big = c.elements().length > HUGE_ELEMENTS;
+    c.layout({ ...buildLayout(perfMode, name), randomize: true, animate: !big }).run();
   }
 
   // (Re)carrega o painel do host (sempre janela cheia; ESTADO distingue ativas)
@@ -1712,29 +1912,78 @@ cy.current.on('tap', (evt) => {
   }
 
   function focusSearch() {
-    if (!search || !cy.current) return;
+    if (!search) return;
     focusIp(search.trim());
   }
 
-  // Centraliza e abre o detalhe de um IP (usado pela busca e pelos alertas)
+  // Centraliza e abre o detalhe de um IP (busca, alertas, outras telas).
+  // Se o IP não está desenhado (ficou fora das N maiores conexões), foca o
+  // host: o backend devolve só as conexões dele e o nó é selecionado ao chegar.
   function focusIp(ip) {
-    if (!ip || !cy.current) return;
-    if (view === 'subnets') { setView('hosts'); setFocusSubnet(null); }
-    setFocusHost(null);
-    // espera o grafo de hosts remontar antes de procurar o nó
-    setTimeout(() => {
-      const node = cy.current.getElementById(ip);
-      if (node && node.length) {
-        cy.current.center(node);
-        node.select();
-        node.trigger('tap');
-      } else {
-        alert(`IP ${ip} não encontrado no grafo atual.`);
-      }
-    }, view === 'subnets' ? 700 : 0);
+    const target = String(ip || '').trim();
+    if (!target) return;
+    if (!/^[0-9a-fA-F:.]+$/.test(target)) { setMapNotice(`"${target}" não parece um IP.`); return; }
+    const node = view !== 'subnets' ? cy.current?.getElementById(target) : null;
+    if (node && node.length) {
+      cy.current.center(node);
+      cy.current.elements(':selected').unselect();
+      node.select();
+      node.trigger('tap');
+      return;
+    }
+    if (focusHost === target && view !== 'subnets') {
+      setMapNotice(`IP ${target} não tem tráfego nesta janela (com os filtros atuais).`);
+      return;
+    }
+    pendingSelectRef.current = target;
+    setView('hosts');
+    setFocusSubnet(null);
+    setFocusHost(target);
   }
 
-  const protos = [...new Set(graph.edges.map((e) => e.data.protocol))].sort();
+  // ---- Controles do canvas -------------------------------------------
+  function mapZoom(factor) {
+    const c = cy.current;
+    if (!c) return;
+    const el = c.container();
+    c.zoom({ level: c.zoom() * factor, renderedPosition: { x: el.clientWidth / 2, y: el.clientHeight / 2 } });
+  }
+  function mapFit() { try { cy.current?.fit(undefined, 40); } catch { /* ignore */ } }
+  function mapCenterSelected() {
+    const c = cy.current;
+    const id = selected || edgeInfo?.id;
+    const el = id ? c?.getElementById(id) : null;
+    if (el && el.length) c.animate({ center: { eles: el }, zoom: Math.max(c.zoom(), 1) }, { duration: 300 });
+  }
+  function mapExportPng() {
+    const c = cy.current;
+    if (!c) return;
+    try {
+      const url = c.png({ full: true, scale: 2, bg: '#ffffff', maxWidth: 8000, maxHeight: 8000 });
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `mapa-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.png`;
+      a.click();
+    } catch (e) {
+      setMapNotice(`Não foi possível exportar a imagem${useWebgl ? ' (desligue o WebGL e tente de novo)' : ''}: ${e.message}`);
+    }
+  }
+  function toggleCard(key) { setCollapsedCards((prev) => ({ ...prev, [key]: !prev[key] })); }
+
+  const protos = useMemo(() => [...new Set(graph.edges.map((e) => e.data.protocol))].sort(), [graph]);
+  // Portas de serviço presentes no grafo (com nome conhecido), por volume.
+  const portOptions = useMemo(() => {
+    const map = new Map();
+    for (const e of graph.edges) {
+      for (const p of e.data.dstPorts || []) {
+        if (p.port == null || !p.service) continue;
+        const cur = map.get(p.port) || { port: p.port, service: p.service, bytes: 0 };
+        cur.bytes += p.bytes || 0;
+        map.set(p.port, cur);
+      }
+    }
+    return [...map.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 60);
+  }, [graph]);
   const selectedInventoryServer = inventoryData.find((server) => server.id === inventorySelectedId) || inventoryData[0] || null;
   const dashboardScreenProps = {
     dashboardTab, closeDashboard, topTalkersConfig,
@@ -1784,8 +2033,54 @@ cy.current.on('tap', (evt) => {
     tip, perfMode, edgeInfo, subnetEmpty, topPortsLabel, portsShort,
     hostDetail, inventoryNameForIp, isPublicIp, openIpModal, repMap,
     repColorForScore, checkRep, repLoading, fmtBytes, dirArrow, fmtTime,
-    timeAgo, repDot
+    timeAgo, repDot, maxEdgeBytes, edgeLimit, changeEdgeLimit, useWebgl,
+    changeWebgl, layoutNote, loading,
+    portFilter, setPortFilter, portOptions, trafficFilter, setTrafficFilter,
+    minFlows, setMinFlows, highlightRisk, setHighlightRisk, riskCount,
+    legendOpen, setLegendOpen, collapsedCards, toggleCard, mapNotice, setMapNotice,
+    mapZoom, mapFit, mapCenterSelected, mapExportPng
   };
+
+  const mapActive = !inventoryOpen && !dashboardOpen && !repDbOpen && !fortigateOpen && !expOpen;
+
+  // Aviso do mapa some sozinho.
+  useEffect(() => {
+    if (!mapNotice) return undefined;
+    const t = setTimeout(() => setMapNotice(''), 7000);
+    return () => clearTimeout(t);
+  }, [mapNotice]);
+
+  // Atualização automática: só com janela relativa, aba visível e mapa na tela.
+  // O cache do backend (20 s) absorve abas/usuários repetindo a mesma janela.
+  useEffect(() => {
+    if (!autoRefresh || useCustom || !mapActive) return undefined;
+    const t = setInterval(() => {
+      if (document.visibilityState !== 'visible' || loadReqRef.inFlight) return;
+      load({ keepSelection: true });
+    }, autoRefresh * 1000);
+    return () => clearInterval(t);
+  }, [autoRefresh, useCustom, mapActive, minutes, edgeLimit]); // eslint-disable-line
+
+  // Esc: limpa seleção; de novo, sai do foco de host; de novo, do foco de sub-rede.
+  useEffect(() => {
+    if (!mapActive) return undefined;
+    const onKey = (e) => {
+      if (e.key !== 'Escape' || ipModal) return;
+      const tag = String(e.target?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
+      if (document.querySelector('.modal-backdrop')) return; // um modal aberto trata o próprio Esc
+      if (selected || edgeInfo) {
+        cy.current?.elements(':selected').unselect();
+        setSelected(null); setHostDetail(null); setEdgeInfo(null);
+      } else if (focusHost) {
+        setFocusHost(null);
+      } else if (focusSubnet) {
+        setFocusSubnet(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mapActive, selected, edgeInfo, focusHost, focusSubnet, ipModal]);
 
   return (
     <div className={`layout${repDbOpen ? ' rep-page' : ''}${dashboardOpen ? ' dashboard-page' : ''}${inventoryOpen ? ' inventory-page' : ''}${fortigateOpen ? ' fortigate-page' : ''}`}>
@@ -1822,7 +2117,12 @@ cy.current.on('tap', (evt) => {
               </span>
             )}
             <label className="chk"><input type="checkbox" checked={useCustom} onChange={(e) => setUseCustom(e.target.checked)} /> personalizado</label>
-            <button onClick={load} disabled={loading}>{loading ? 'Carregando…' : 'Atualizar'}</button>
+            <button onClick={() => load({ fresh: true })} disabled={loading}>{loading ? 'Carregando…' : 'Atualizar'}</button>
+            <select className="auto-refresh" value={autoRefresh} onChange={(e) => setAutoRefresh(Number(e.target.value))} disabled={useCustom} title={useCustom ? 'Atualização automática só vale para janelas relativas' : 'Atualizar o mapa sozinho'}>
+              <option value={0}>Auto: desligado</option>
+              <option value={60}>Auto: 1 min</option>
+              <option value={300}>Auto: 5 min</option>
+            </select>
           </div>
         </div>
         <div className="topbar-row">
@@ -1856,13 +2156,17 @@ cy.current.on('tap', (evt) => {
       </header>
 
       {fortigateOpen && (
-        <div className="fortigate-page full" style={{ display:'flex', flexDirection:'column', height:'calc(100vh - 90px)', overflow:'auto' }}>
-          <div style={{ display:'flex', gap:8, padding:'8px 14px', borderBottom:'1px solid var(--line)', background:'var(--panel)', flexShrink:0 }}>
-            <button className={`tool${fgTab==='firewalls'?' active':''}`} onClick={()=>setFgTab('firewalls')}>Firewalls</button>
-            <button className={`tool${fgTab==='backups'?' active':''}`} onClick={()=>setFgTab('backups')}>Backups</button>
-          </div>
-          <div style={{ flex:1, overflow:'auto' }}>
-            {fgTab === 'firewalls' ? <FortigatePage /> : <FortigateBackupsScreen firewalls={fortigates} onClose={()=>setFortigateOpen(false)} />}
+        <div className="fgt-shell">
+          <nav className="fgt-subnav" aria-label="FortiGate">
+            <span className="fgt-subnav-title">FortiGate</span>
+            <button className={`fgt-subnav-tab${fgTab === 'firewalls' ? ' active' : ''}`} onClick={() => setFgTab('firewalls')}>Firewalls e políticas</button>
+            <button className={`fgt-subnav-tab${fgTab === 'backups' ? ' active' : ''}`} onClick={() => setFgTab('backups')}>Backups</button>
+            <button className={`fgt-subnav-tab${fgTab === 'audit' ? ' active' : ''}`} onClick={() => setFgTab('audit')}>Auditoria</button>
+          </nav>
+          <div className="fgt-shell-body">
+            {fgTab === 'firewalls' && <FortigatePage />}
+            {fgTab === 'backups' && <FortigateBackupsScreen firewalls={fortigates} />}
+            {fgTab === 'audit' && <FortigateAuditScreen firewalls={fortigates} />}
           </div>
         </div>
       )}
@@ -1902,7 +2206,7 @@ cy.current.on('tap', (evt) => {
                     <span>País / ISP</span><b>{[a?.countryName || a?.country, a?.isp].filter(Boolean).join(' · ') || '-'}</b>
                     <span>Uso</span><b>{a?.usageType || '-'}</b>
                   </div>
-                  <InventoryContext data={ipModal.inventory} />
+                  <InventoryContext key={ipModal.ip} data={ipModal.inventory} />
 
                   <h3>Reputação <i className={`dot ${v.dot}`} /> {v.label}{a ? ` · score ${a.score}` : ''}</h3>
                   {a && (
@@ -1916,12 +2220,13 @@ cy.current.on('tap', (evt) => {
                   </div>
 
                   <h3>Tráfego na janela</h3>
-                  {ipModal.truncated && <p className="error">A consulta atingiu o limite de buckets; este dossiê pode estar incompleto. Reduza o período.</p>}
+                  {ipModal.traffic.unavailable && <p className="error">Não foi possível consultar o tráfego deste IP agora (Elasticsearch indisponível ou ocupado).</p>}
                   <div className="kpis">
                     <div><b>{fmtBytes(ipModal.traffic.outBytes)}</b><span>saída</span></div>
                     <div><b>{fmtBytes(ipModal.traffic.inBytes)}</b><span>entrada</span></div>
-                    <div><b>{ipModal.traffic.flows}</b><span>fluxos</span></div>
+                    <div><b>{Number(ipModal.traffic.flows || 0).toLocaleString('pt-BR')}</b><span>fluxos</span></div>
                   </div>
+                  {ipModal.traffic.truncated && <p className="hint">Lista com os peers de maior volume; os totais acima são exatos.</p>}
                   <div className="kv">
                     <span>Pacotes out/in</span><b>{ipModal.traffic.outPackets} / {ipModal.traffic.inPackets}</b>
                     <span>Top portas</span><b className="mono">{ipModal.traffic.topPorts.map((p) => `${p.port ?? '?'}·${fmtBytes(p.bytes)}`).join(', ') || '-'}</b>
@@ -1971,7 +2276,6 @@ cy.current.on('tap', (evt) => {
               {cmpError && <p className="error">{cmpError}</p>}
               {cmpData && (
                 <>
-                  {cmpData.truncated && <p className="error">A consulta atingiu o limite de buckets; a comparação pode estar incompleta. Reduza o período.</p>}
                   <div className="kpis kpis-2">
                     <div><b>{cmpData.a}</b><span>→ {fmtBytes(cmpData.aToB.bytes)} · {cmpData.aToB.flows} fluxos</span></div>
                     <div><b>{cmpData.b}</b><span>→ {fmtBytes(cmpData.bToA.bytes)} · {cmpData.bToA.flows} fluxos</span></div>

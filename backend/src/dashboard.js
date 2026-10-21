@@ -13,6 +13,15 @@ function either(clauses) {
     : { match_none: {} };
 }
 
+// Janela + restrição de topo. Antes a query era só o range de tempo e os
+// filtros ficavam nas agregações: o ES avaliava dezenas (aplicações) ou
+// centenas (portas conhecidas) de filtros em CADA fluxo da janela, inclusive
+// os que não têm nada a ver com a máquina. Com o filtro no topo, ele usa o
+// índice para pegar só os fluxos da máquina e as agregações rodam sobre eles.
+function scopedQuery(query, scope) {
+  return { bool: { filter: [{ range: buildTimeRange(query) }, scope] } };
+}
+
 async function topApplications(serverId, query) {
   const servers = await listInventory();
   const server = servers.find((item) => item.id === Number(serverId));
@@ -25,6 +34,7 @@ async function topApplications(serverId, query) {
   const filters = {};
   const incomingFilters = {};
   const outgoingFilters = {};
+  const allClauses = [];
   for (const application of server.applications) {
     const incoming = [];
     const outgoing = [];
@@ -46,12 +56,13 @@ async function topApplications(serverId, query) {
     filters[key] = either([...incoming, ...outgoing]);
     incomingFilters[key] = either(incoming);
     outgoingFilters[key] = either(outgoing);
+    allClauses.push(...incoming, ...outgoing);
   }
 
   const response = await searchElastic({
     index: ELASTIC_INDEX,
     size: 0,
-    query: { range: buildTimeRange(query) },
+    query: scopedQuery(query, either(allClauses)),
     aggs: {
       applications: {
         filters: { filters },
@@ -150,7 +161,7 @@ async function applicationConnections(serverId, applicationId, query) {
   const response = await searchElastic({
     index: ELASTIC_INDEX,
     size: 0,
-    query: { range: buildTimeRange(query) },
+    query: scopedQuery(query, either([...incomingMatches, ...outgoingMatches])),
     aggs: {
       incoming: {
         filter: either(incomingMatches),
@@ -237,7 +248,8 @@ async function topKnownPorts(serverId, query, limit = 5) {
   const response = await searchElastic({
     index: ELASTIC_INDEX,
     size: 0,
-    query: { range: buildTimeRange(query) },
+    // Só fluxos da máquina: os ~100 filtros de porta deixam de rodar na janela inteira.
+    query: scopedQuery(query, either([{ terms: { [F_DST]: ips } }, { terms: { [F_SRC]: ips } }])),
     aggs: {
       known_ports: {
         filters: { filters: allPortFilters },

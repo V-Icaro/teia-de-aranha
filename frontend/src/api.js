@@ -62,12 +62,21 @@ export async function resolveNames(ips) {
   return r.json(); // { names: {ip: name}, subnets: {ip: subnet} }
 }
 
-export async function fetchGraph({ minutes, from, to }) {
+// limit = arestas de maior volume (0 = máximo do backend) · cidr/ip = recorte
+// feito no backend antes do top-N · fresh = ignora o cache curto do backend.
+export async function fetchGraph({ minutes, from, to, limit, cidr, ip, fresh } = {}) {
   const p = new URLSearchParams();
   if (from && to) { p.set('from', from); p.set('to', to); }
   else p.set('minutes', String(minutes));
+  if (limit != null) p.set('limit', String(limit));
+  if (ip) p.set('ip', ip);
+  else if (cidr) p.set('cidr', cidr);
+  if (fresh) p.set('fresh', '1');
   const r = await fetch(`/api/graph?${p.toString()}`);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || `HTTP ${r.status}`);
+  }
   return r.json();
 }
 
@@ -349,8 +358,11 @@ export const deleteFortigate = (id) => fortigateReq(`/${id}`, { method: 'DELETE'
 export const testFortigate = (id) => fortigateReq(`/${id}/test`, { method: 'POST' });
 export const fetchFortigatePolicies = (id, { limit = 20, sort = 'hits', offset = 0, vdom = 'root' } = {}) =>
   fortigateReq(`/${id}/policies?limit=${limit}&sort=${encodeURIComponent(sort)}&offset=${offset}&vdom=${encodeURIComponent(vdom)}`);
+export const fetchFortigatePolicyTable = (id, vdom = 'root') =>
+  fortigateReq(`/${id}/policy-table?vdom=${encodeURIComponent(vdom || 'root')}`);
 export const fetchFortigatePolicyDetail = (id, policyId, vdom) =>
   fortigateReq(`/${id}/policy/${encodeURIComponent(policyId)}?vdom=${encodeURIComponent(vdom || 'root')}`);
+export const fetchFortigateAudit = (id) => fortigateReq(`/${id}/audit`);
 export const fetchFortigateAnalysis = (id, { staleDays = 90, vdom } = {}) =>
   fortigateReq(`/${id}/analysis?staleDays=${encodeURIComponent(staleDays)}${vdom ? `&vdom=${encodeURIComponent(vdom)}` : ''}`);
 

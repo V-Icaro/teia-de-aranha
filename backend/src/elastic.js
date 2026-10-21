@@ -500,114 +500,49 @@ function addInventoryFlowFilter(target, ips, flowType = 'both') {
   }
 }
 
-async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = null, flowType = 'both', pagina = 3000, maxPaginas = 12 } = {}) {
-  const baseQuery = buildBaseQuery(query);
-  addInventoryFlowFilter(baseQuery, inventoryIps, flowType);
-
+// Top pares que mais conversam (Pares e Dashboard → Tráfego).
+// O ranking por bytes sai da agregação por par JÁ CACHEADA (getPairGraph, a
+// mesma do mapa): antes cada tela paginava o composite inteiro de novo, até
+// 36 mil pares. O filtro de inventário/direção é aplicado nas arestas
+// direcionais, com a mesma semântica do filtro que ia para o ES:
+//   ingress = só fluxos com destino no inventário; egress = origem; both = qualquer.
+// Só os `limit` pares do topo recebem a consulta de detalhe (direção TCP,
+// início/fim, protocolos, portas), em UMA ida ao ES.
+async function fetchTopPairs(query, { limit = 10, subnet = null, inventoryIps = null, flowType = 'both' } = {}) {
+  const { data } = await getPairGraph(query);
+  const inv = inventoryIps?.length ? new Set(inventoryIps) : null;
   const grupos = new Map();
-  let after = null;
-  let paginas = 0;
-  let truncadoES = false;
-
-  do {
-    const composite = {
-      size: pagina,
-      sources: [
-        { origem: { terms: { field: F_SRC } } },
-        { destino: { terms: { field: F_DST } } }
-      ]
-    };
-    if (after) composite.after = after;
-
-    const r = await searchElastic({
-      index: ELASTIC_INDEX, size: 0, query: baseQuery,
-      aggs: {
-        pares: {
-          composite,
-          aggs: {
-            bytes: { sum: { field: 'netflow.octetDeltaCount' } },
-            pacotes: { sum: { field: 'netflow.packetDeltaCount' } },
-            fluxoInicio: { min: { field: F_FEND } },
-            fluxoFim: { max: { field: F_FEND } },
-            synNoAck: { filter: { terms: { [F_TCP_FLAGS]: TCP_SYN_NO_ACK_VALUES } } },
-            synAck: { filter: { terms: { [F_TCP_FLAGS]: TCP_SYN_ACK_VALUES } } },
-            flowDirections: { terms: { field: F_FLOW_DIRECTION, size: 4 } }
-          }
-        }
-      }
-    });
-
-    const buckets = r.aggregations?.pares?.buckets || [];
-    for (const bucket of buckets) {
-      const s = String(bucket.key.origem);
-      const d = String(bucket.key.destino);
-      if (!s || !d || s === d) continue;
-      const bytes = bucket.bytes?.value || 0;
-      const ini = bucket.fluxoInicio?.value_as_string
-        || (bucket.fluxoInicio?.value != null ? new Date(bucket.fluxoInicio.value).toISOString() : null);
-      const fim = bucket.fluxoFim?.value_as_string
-        || (bucket.fluxoFim?.value != null ? new Date(bucket.fluxoFim.value).toISOString() : null);
-
-      // Chave normalizada: X→Y e Y→X caem no mesmo grupo.
-      const baixoEhPrimeiro = s < d;
-      const k = baixoEhPrimeiro ? `${s}|${d}` : `${d}|${s}`;
-      let g = grupos.get(k);
-      if (!g) {
-        g = {
-          a: baixoEhPrimeiro ? s : d, b: baixoEhPrimeiro ? d : s,
-          bytes: 0, pacotes: 0, fluxos: 0,
-          bytesBaixo: 0, bytesAlto: 0,
-          inicio: null, fim: null, protocolos: new Set(), portas: new Map(),
-          initiatorVotes: new Map(), flowDirections: new Map(), synNoAckFlows: 0, synAckFlows: 0
-        };
-        grupos.set(k, g);
-      }
-      g.bytes += bytes;
-      g.pacotes += bucket.pacotes?.value || 0;
-      g.fluxos += bucket.doc_count || 0;
-      if (baixoEhPrimeiro) g.bytesBaixo += bytes; else g.bytesAlto += bytes;
-      const synNoAckFlows = bucket.synNoAck?.doc_count || 0;
-      const synAckFlows = bucket.synAck?.doc_count || 0;
-      g.synNoAckFlows += synNoAckFlows;
-      g.synAckFlows += synAckFlows;
-      if (synNoAckFlows) g.initiatorVotes.set(s, (g.initiatorVotes.get(s) || 0) + synNoAckFlows);
-      if (synAckFlows) g.initiatorVotes.set(d, (g.initiatorVotes.get(d) || 0) + synAckFlows);
-      for (const direction of bucket.flowDirections?.buckets || []) {
-        const key = Number(direction.key);
-        g.flowDirections.set(key, (g.flowDirections.get(key) || 0) + (direction.doc_count || 0));
-      }
-      if (ini && (!g.inicio || ini < g.inicio)) g.inicio = ini;
-      if (fim && (!g.fim || fim > g.fim)) g.fim = fim;
+  for (const e of data.edges) {
+    const s = e.data.source;
+    const d = e.data.target;
+    if (inv) {
+      if (flowType === 'ingress' && !inv.has(d)) continue;
+      if (flowType === 'egress' && !inv.has(s)) continue;
+      if (flowType !== 'ingress' && flowType !== 'egress' && !inv.has(s) && !inv.has(d)) continue;
     }
-
-    // `after_key` não distingue "terminou" de "tem mais": vem preenchido na
-    // última página também. O corte é a página vir cheia com o teto de páginas.
-    paginas++;
-    after = r.aggregations?.pares?.after_key || null;
-    if (after && paginas >= maxPaginas) {
-      const probe = await searchElastic({
-        index: ELASTIC_INDEX, size: 0, query: baseQuery,
-        aggs: { pares: { composite: { size: 1, after, sources: composite.sources } } }
-      });
-      truncadoES = (probe.aggregations?.pares?.buckets || []).length > 0;
+    const baixoEhPrimeiro = s < d;
+    const k = baixoEhPrimeiro ? `${s}|${d}` : `${d}|${s}`;
+    let g = grupos.get(k);
+    if (!g) {
+      g = {
+        a: baixoEhPrimeiro ? s : d, b: baixoEhPrimeiro ? d : s,
+        bytes: 0, pacotes: 0, fluxos: 0, bytesBaixo: 0, bytesAlto: 0,
+        inicio: null, fim: null, protocolos: new Set(), portas: new Map(),
+        initiatorVotes: new Map(), flowDirections: new Map(), synNoAckFlows: 0, synAckFlows: 0
+      };
+      grupos.set(k, g);
     }
-  } while (after && paginas < maxPaginas);
+    g.bytes += e.data.bytes || 0;
+    g.pacotes += e.data.packets || 0;
+    g.fluxos += e.data.flows || 0;
+    if (baixoEhPrimeiro) g.bytesBaixo += e.data.bytes || 0; else g.bytesAlto += e.data.bytes || 0;
+  }
 
-  // A subnet filtra em JS, com o MESMO cidrContains que o resto do backend usa.
-  // Havia antes um script painless equivalente na query: os campos de IP são
-  // text+keyword (sem range nativo), o script quebrava em IPv6 e em `split`, e
-  // manter duas cópias do mesmo teste é como os dois lados divergem em silêncio.
-  // Não compensa: o composite sem protocolo/porta é barato o bastante (6.223
-  // buckets em 7 dias, ~2,5s) para paginar tudo e descartar o resto aqui.
   const todos = [...grupos.values()].sort((x, y) => y.bytes - x.bytes);
-  const lista = subnet
-    ? todos.filter((g) => cidrContains(subnet, g.a) || cidrContains(subnet, g.b))
-    : todos;
-
-  // Só os que passam no corte recebem detalhe de protocolo/porta.
+  const lista = subnet ? todos.filter((g) => cidrContains(subnet, g.a) || cidrContains(subnet, g.b)) : todos;
   const topo = lista.slice(0, limit);
   if (topo.length) await detalharPares(query, topo, { inventoryIps, flowType });
-  return { grupos: lista, candidatos: lista.length, topo, truncadoES };
+  return { grupos: lista, candidatos: lista.length, topo, truncadoES: data.truncated };
 }
 
 function conversationDirection(group) {
@@ -633,27 +568,24 @@ function conversationDirection(group) {
   };
 }
 
-// Detalhe (protocolo + portas) dos `limit` pares do ranking, em UMA query.
-// Um `should` por par, nos dois sentidos: filtrar pelos IPs soltos deixaria
-// passar qualquer outro par que envolva um deles e contaminaria a linha.
+// Detalhe dos `limit` pares do ranking, em UMA query: direção pelo TCP
+// (SYN sem ACK = quem iniciou), flowDirection, início/fim, protocolos e
+// portas. Um `should` por par, nos dois sentidos: filtrar pelos IPs soltos
+// deixaria passar outro par que envolva um deles e contaminaria a linha.
 async function detalharPares(query, pares, inventoryScope = {}) {
   const q = buildBaseQuery(query);
   addInventoryFlowFilter(q, inventoryScope.inventoryIps, inventoryScope.flowType);
   q.bool.filter.push({
     bool: {
       should: pares.flatMap((p) => [
-        { bool: { must: [{ term: { [F_SRC]: p.a } }, { term: { [F_DST]: p.b } }] } },
-        { bool: { must: [{ term: { [F_SRC]: p.b } }, { term: { [F_DST]: p.a } }] } }
+        { bool: { filter: [{ term: { [F_SRC]: p.a } }, { term: { [F_DST]: p.b } }] } },
+        { bool: { filter: [{ term: { [F_SRC]: p.b } }, { term: { [F_DST]: p.a } }] } }
       ]),
       minimum_should_match: 1
     }
   });
 
   const porChave = new Map(pares.map((p) => [`${p.a}|${p.b}`, p]));
-  // Composite só de (src,dst) e protocolo/porta como `terms` dentro de cada par.
-  // Antes eram 4 fontes no composite: ele ordena por CHAVE, não por bytes, então
-  // o teto de buckets cortava as portas grandes e a linha saía sem porta nenhuma.
-  // Aqui a cardinalidade é ~2x `pares`, então não há o que estourar.
   const r = await searchElastic({
     index: ELASTIC_INDEX, size: 0, query: q,
     aggs: {
@@ -666,23 +598,40 @@ async function detalharPares(query, pares, inventoryScope = {}) {
           ]
         },
         aggs: {
-          // `missing_bucket` é opção de fonte do composite, não de `terms`.
-          // Sem ele, fluxo sem protocolo/porta simplesmente não entra no bucket.
+          fluxoInicio: { min: { field: F_FSTART } },
+          fluxoFim: { max: { field: F_FEND } },
+          synNoAck: { filter: { terms: { [F_TCP_FLAGS]: TCP_SYN_NO_ACK_VALUES } } },
+          synAck: { filter: { terms: { [F_TCP_FLAGS]: TCP_SYN_ACK_VALUES } } },
+          flowDirections: { terms: { field: F_FLOW_DIRECTION, size: 4 } },
           protocolos: { terms: { field: F_PROTO, size: 20 } },
           portas: {
-            terms: { field: F_DPORT, size: 20 },
+            terms: { field: F_DPORT, size: 20, order: { bytes: 'desc' } },
             aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } }
           }
         }
       }
     }
   });
+  const isoOf = (agg) => agg?.value_as_string || (agg?.value != null ? new Date(agg.value).toISOString() : null);
   for (const bucket of r.aggregations?.pares?.buckets || []) {
     const s = String(bucket.key.origem);
     const d = String(bucket.key.destino);
-    const k = s < d ? `${s}|${d}` : `${d}|${s}`;
-    const alvo = porChave.get(k);
+    const alvo = porChave.get(s < d ? `${s}|${d}` : `${d}|${s}`);
     if (!alvo) continue;
+    const ini = isoOf(bucket.fluxoInicio);
+    const fim = isoOf(bucket.fluxoFim);
+    if (ini && (!alvo.inicio || ini < alvo.inicio)) alvo.inicio = ini;
+    if (fim && (!alvo.fim || fim > alvo.fim)) alvo.fim = fim;
+    const synNoAckFlows = bucket.synNoAck?.doc_count || 0;
+    const synAckFlows = bucket.synAck?.doc_count || 0;
+    alvo.synNoAckFlows += synNoAckFlows;
+    alvo.synAckFlows += synAckFlows;
+    if (synNoAckFlows) alvo.initiatorVotes.set(s, (alvo.initiatorVotes.get(s) || 0) + synNoAckFlows);
+    if (synAckFlows) alvo.initiatorVotes.set(d, (alvo.initiatorVotes.get(d) || 0) + synAckFlows);
+    for (const direction of bucket.flowDirections?.buckets || []) {
+      const key = Number(direction.key);
+      alvo.flowDirections.set(key, (alvo.flowDirections.get(key) || 0) + (direction.doc_count || 0));
+    }
     for (const proto of bucket.protocolos?.buckets || []) {
       if (proto.key != null) alvo.protocolos.add(proto.key);
     }
@@ -693,6 +642,73 @@ async function detalharPares(query, pares, inventoryScope = {}) {
       alvo.portas.set(dp, cur);
     }
   }
+}
+
+// Tráfego de UM IP (dossiê). Antes: composite com porta de origem, que
+// explode em IP movimentado e, ao bater no teto, subestimava os totais.
+// Agora uma consulta só: totais exatos por direção (filter + sum), top
+// peers por bytes em cada sentido e top portas destino.
+async function fetchIpTraffic(query, ip) {
+  const q = buildBaseQuery(query);
+  q.bool.filter.push({ bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 } });
+  const sum = (field) => ({ sum: { field } });
+  const peerTerms = (field) => ({
+    terms: { field, size: 15, order: { bytes: 'desc' } },
+    aggs: { bytes: sum('netflow.octetDeltaCount'), portas: { terms: { field: F_DPORT, size: 10 } } }
+  });
+  const r = await searchElastic({
+    index: ELASTIC_INDEX, size: 0, track_total_hits: true, query: q,
+    aggs: {
+      saida: { filter: { term: { [F_SRC]: ip } }, aggs: { bytes: sum('netflow.octetDeltaCount'), pacotes: sum('netflow.packetDeltaCount'), peers: peerTerms(F_DST) } },
+      entrada: { filter: { term: { [F_DST]: ip } }, aggs: { bytes: sum('netflow.octetDeltaCount'), pacotes: sum('netflow.packetDeltaCount'), peers: peerTerms(F_SRC) } },
+      portas: { terms: { field: F_DPORT, size: 10, order: { bytes: 'desc' } }, aggs: { bytes: sum('netflow.octetDeltaCount') } }
+    }
+  });
+  const a = r.aggregations || {};
+  const peers = new Map();
+  for (const b of [...(a.saida?.peers?.buckets || []), ...(a.entrada?.peers?.buckets || [])]) {
+    const key = String(b.key);
+    const cur = peers.get(key) || { ip: key, bytes: 0, flows: 0, ports: new Set() };
+    cur.bytes += b.bytes?.value || 0;
+    cur.flows += b.doc_count || 0;
+    for (const p of b.portas?.buckets || []) if (p.key != null) cur.ports.add(p.key);
+    peers.set(key, cur);
+  }
+  // Peers fora do top 15 de cada sentido não aparecem na lista (os totais acima seguem exatos).
+  const truncated = Boolean(a.saida?.peers?.sum_other_doc_count || a.entrada?.peers?.sum_other_doc_count);
+  return {
+    outBytes: a.saida?.bytes?.value || 0,
+    outPackets: a.saida?.pacotes?.value || 0,
+    inBytes: a.entrada?.bytes?.value || 0,
+    inPackets: a.entrada?.pacotes?.value || 0,
+    flows: typeof r.hits?.total === 'number' ? r.hits.total : (r.hits?.total?.value || 0),
+    truncated,
+    topPeers: [...peers.values()]
+      .map((p) => ({ ip: p.ip, bytes: Math.round(p.bytes), flows: p.flows, ports: [...p.ports].slice(0, 10) }))
+      .sort((x, y) => y.bytes - x.bytes).slice(0, 10),
+    topPorts: (a.portas?.buckets || []).map((b) => ({ port: b.key ?? null, bytes: Math.round(b.bytes?.value || 0), flows: b.doc_count || 0 }))
+  };
+}
+
+// Comparador de dois hosts: só os fluxos DO PAR (filtrados no ES), com
+// direções, top portas e timeline numa consulta. Antes lia todos os fluxos
+// de A com porta de origem e filtrava B no código.
+async function fetchPairCompare({ a, b, from, to, interval }) {
+  const range = { '@timestamp': { gte: from, lte: to } };
+  const dir = (src, dst) => ({ bool: { filter: [{ term: { [F_SRC]: src } }, { term: { [F_DST]: dst } }] } });
+  const sum = (field) => ({ sum: { field } });
+  const sideAggs = {
+    bytes: sum('netflow.octetDeltaCount'),
+    pacotes: sum('netflow.packetDeltaCount'),
+    portas: { terms: { field: F_DPORT, size: 10, order: { bytes: 'desc' } }, aggs: { bytes: sum('netflow.octetDeltaCount') } },
+    over: { date_histogram: { field: '@timestamp', fixed_interval: interval, min_doc_count: 0, extended_bounds: { min: from, max: to } }, aggs: { bytes: sum('netflow.octetDeltaCount') } }
+  };
+  const r = await searchElastic({
+    index: ELASTIC_INDEX, size: 0,
+    query: { bool: { filter: [{ range }, { bool: { should: [dir(a, b), dir(b, a)], minimum_should_match: 1 } }] } },
+    aggs: { aToB: { filter: dir(a, b), aggs: sideAggs }, bToA: { filter: dir(b, a), aggs: sideAggs } }
+  });
+  return r.aggregations || {};
 }
 
 async function fetchConnections(query, { pageSize = 1000, maxEdges = 50000, ip = null, withSport = false, activeSec = null, withTimes = false }) {
@@ -850,7 +866,247 @@ function toCytoscape(buckets) {
   return { nodes, edges };
 }
 
+// Aresta no formato que o front já consome (mesmo de toCytoscape).
+function mapEdge(source, target, protoNum, bytes, packets, flows, ports) {
+  const ranked = rankPorts(ports);
+  const top = ranked[0] || { port: null, bytes: 0, flows: 0 };
+  return {
+    data: {
+      id: `${source}|${target}|${protoNum ?? 'x'}`,
+      source,
+      target,
+      bytes: Math.round(bytes),
+      packets: Math.round(packets),
+      protocolNum: protoNum,
+      protocol: protocolName(protoNum),
+      srcPort: null,
+      srcPorts: [],
+      dstPort: top.port,
+      port: top.port,
+      dstPorts: ranked.slice(0, 8).map((d) => ({ port: d.port, service: portName(d.port), bytes: Math.round(d.bytes), flows: d.flows })),
+      flows,
+      service: portName(top.port),
+      servicePort: isServicePort(top.port),
+      bytesPerPacket: packets > 0 ? Math.round(bytes / packets) : null,
+      packetsPerFlow: flows > 0 ? Math.round(packets / flows) : null,
+      portLabel: isServicePort(top.port) ? serviceLabel(top.port, flows) : `retorno · ${flows} fluxos`
+    }
+  };
+}
+
+// Grafo do MAPA. Antes usava fetchConnections (composite src+dst+protocolo+
+// porta), que gera um bucket por porta destino e explode com tráfego de
+// retorno: cada porta efêmera vira bucket, e um portgroup movimentado passa
+// de dezenas de milhares de buckets em 15 minutos, com uma ida ao ES a cada
+// 1.000. Aqui o composite é só por PAR (src,dst) — a cardinalidade que o
+// mapa realmente desenha — e protocolo/portas vêm como sub-agregação `terms`
+// dentro de cada par (top 8 protocolos, top 10 portas por bytes).
+// O que não cabe nos tops (protocolo raro, fluxo sem protocolo) não some:
+// a diferença entre o total do par e a soma dos protocolos vira uma aresta
+// de protocolo desconhecido.
+async function fetchMapGraph(query, { pageSize = 2000, maxPairs = 200000, ip = null } = {}) {
+  const baseQuery = buildBaseQuery(query);
+  if (ip) {
+    baseQuery.bool.filter.push({
+      bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 }
+    });
+  }
+  const sources = [
+    { origem: { terms: { field: F_SRC } } },
+    { destino: { terms: { field: F_DST } } }
+  ];
+  const edges = [];
+  let after = null;
+  let pairs = 0;
+  let pages = 0;
+  let truncated = false;
+  const startedAt = Date.now();
+
+  while (pairs < maxPairs) {
+    const composite = { size: Math.min(pageSize, maxPairs - pairs), sources };
+    if (after) composite.after = after;
+    const resp = await searchElastic({
+      index: ELASTIC_INDEX, size: 0, query: baseQuery,
+      aggs: {
+        pares: {
+          composite,
+          aggs: {
+            bytes: { sum: { field: 'netflow.octetDeltaCount' } },
+            pacotes: { sum: { field: 'netflow.packetDeltaCount' } },
+            protocolos: {
+              terms: { field: F_PROTO, size: 8 },
+              aggs: {
+                bytes: { sum: { field: 'netflow.octetDeltaCount' } },
+                pacotes: { sum: { field: 'netflow.packetDeltaCount' } },
+                portas: {
+                  terms: { field: F_DPORT, size: 10, order: { bytes: 'desc' } },
+                  aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    pages += 1;
+    const agg = resp.aggregations?.pares;
+    const page = agg?.buckets || [];
+    if (!page.length) break;
+
+    for (const b of page) {
+      const source = b.key.origem == null ? '' : String(b.key.origem);
+      const target = b.key.destino == null ? '' : String(b.key.destino);
+      if (!source || !target || source === target) continue;
+      let restBytes = b.bytes?.value || 0;
+      let restPackets = b.pacotes?.value || 0;
+      let restFlows = b.doc_count || 0;
+      for (const pb of b.protocolos?.buckets || []) {
+        const protoNum = Number.isFinite(Number(pb.key)) ? Number(pb.key) : null;
+        const bytes = pb.bytes?.value || 0;
+        const packets = pb.pacotes?.value || 0;
+        const flows = pb.doc_count || 0;
+        restBytes -= bytes; restPackets -= packets; restFlows -= flows;
+        const ports = (pb.portas?.buckets || []).map((p) => ({
+          port: Number.isFinite(Number(p.key)) ? Number(p.key) : null,
+          bytes: p.bytes?.value || 0,
+          flows: p.doc_count || 0
+        }));
+        edges.push(mapEdge(source, target, protoNum, bytes, packets, flows, ports));
+      }
+      if (restFlows > 0) edges.push(mapEdge(source, target, null, Math.max(0, restBytes), Math.max(0, restPackets), restFlows, []));
+    }
+
+    pairs += page.length;
+    after = agg.after_key || null;
+    if (!after) break;
+  }
+
+  if (after && pairs >= maxPairs) {
+    const probe = await searchElastic({
+      index: ELASTIC_INDEX, size: 0, query: baseQuery,
+      aggs: { pares: { composite: { size: 1, after, sources } } }
+    });
+    truncated = (probe.aggregations?.pares?.buckets || []).length > 0;
+  }
+
+  // Maior volume primeiro: o corte top-N da rota vira um slice.
+  edges.sort((a, b) => b.data.bytes - a.data.bytes);
+  return { edges, pairs, pages, truncated, queryMs: Date.now() - startedAt };
+}
+
+// Cache da agregação por par, COMPARTILHADO entre mapa, Pares, Dashboard
+// (Tráfego) e top talkers: todos precisam de "bytes por par na janela".
+// Abrir o mapa e depois Pares na mesma janela não consulta o ES de novo, e
+// pedidos simultâneos da mesma janela dividem a mesma consulta em voo.
+const PAIR_PAGE_SIZE = Math.min(5000, Math.max(500, Number.parseInt(process.env.MAP_PAGE_SIZE || '2000', 10) || 2000));
+const PAIR_MAX_PAIRS = Math.max(1000, Number.parseInt(process.env.MAP_MAX_PAIRS || '200000', 10) || 200000);
+const PAIR_CACHE_TTL_MS = Math.max(0, Number.parseInt(process.env.MAP_CACHE_TTL_MS || '20000', 10) || 0);
+const PAIR_CACHE_MAX = 12;
+const pairCache = new Map(); // chave -> { at, promise }
+
+async function getPairGraph(query, { ip = null, fresh = false } = {}) {
+  buildTimeRange(query); // valida a janela antes de cachear (400 sai na hora)
+  const key = JSON.stringify([query.minutes || null, query.from || null, query.to || null, query.range || null, ip || null]);
+  const hit = pairCache.get(key);
+  // Janela absoluta (from/to) não muda: pode ficar mais tempo no cache.
+  const ttl = query.from && query.to ? PAIR_CACHE_TTL_MS * 15 : PAIR_CACHE_TTL_MS;
+  if (hit && !fresh && Date.now() - hit.at < ttl) return { data: await hit.promise, cached: true };
+  const promise = fetchMapGraph(query, { pageSize: PAIR_PAGE_SIZE, maxPairs: PAIR_MAX_PAIRS, ip });
+  pairCache.set(key, { at: Date.now(), promise });
+  promise.catch(() => { if (pairCache.get(key)?.promise === promise) pairCache.delete(key); });
+  while (pairCache.size > PAIR_CACHE_MAX) pairCache.delete(pairCache.keys().next().value);
+  return { data: await promise, cached: false };
+}
+
+// Detalhe de UM host (painel do mapa). Antes: composite com src+dst+proto+
+// dport+SPORT, que explode em servidor com muitos clientes (cada conexão tem
+// porta de origem nova). Ao bater no teto, os totais saíam menores e os peers
+// cortados eram os últimos em ORDEM DE IP, não os de menor volume.
+// Agora:
+//   - totais de entrada/saída numa agregação à parte, sempre exatos;
+//   - composite só por par (src,dst) envolvendo o host — no máximo 2 buckets
+//     por peer (ida e volta) — com protocolos, janela e top portas dentro.
+async function fetchHostPeers(query, { ip, activeSec = null, maxPairs = 40000, pageSize = 2000 } = {}) {
+  const baseQuery = buildBaseQuery(query);
+  if (activeSec) baseQuery.bool.filter.push({ range: { [F_FEND]: { gte: `now-${activeSec}s` } } });
+  baseQuery.bool.filter.push({
+    bool: { should: [{ term: { [F_SRC]: ip } }, { term: { [F_DST]: ip } }], minimum_should_match: 1 }
+  });
+  const sum = (field) => ({ sum: { field } });
+
+  const totalsPromise = searchElastic({
+    index: ELASTIC_INDEX, size: 0, query: baseQuery,
+    aggs: {
+      saida: { filter: { term: { [F_SRC]: ip } }, aggs: { bytes: sum('netflow.octetDeltaCount'), pacotes: sum('netflow.packetDeltaCount') } },
+      entrada: { filter: { term: { [F_DST]: ip } }, aggs: { bytes: sum('netflow.octetDeltaCount'), pacotes: sum('netflow.packetDeltaCount') } }
+    }
+  });
+
+  const sources = [
+    { origem: { terms: { field: F_SRC } } },
+    { destino: { terms: { field: F_DST } } }
+  ];
+  const buckets = [];
+  let after = null;
+  let truncated = false;
+  while (buckets.length < maxPairs) {
+    const composite = { size: Math.min(pageSize, maxPairs - buckets.length), sources };
+    if (after) composite.after = after;
+    const resp = await searchElastic({
+      index: ELASTIC_INDEX, size: 0, query: baseQuery,
+      aggs: {
+        pares: {
+          composite,
+          aggs: {
+            bytes: sum('netflow.octetDeltaCount'),
+            pacotes: sum('netflow.packetDeltaCount'),
+            firstSeen: { min: { field: F_FSTART } },
+            lastSeen: { max: { field: F_FEND } },
+            protocolos: { terms: { field: F_PROTO, size: 10 } },
+            // Top 5 portas destino por bytes e, dentro de cada uma, top 3
+            // portas de origem: dá os pares sport→dport mais relevantes sem
+            // enumerar cada porta efêmera.
+            portas: {
+              terms: { field: F_DPORT, size: 5, order: { bytes: 'desc' } },
+              aggs: {
+                bytes: sum('netflow.octetDeltaCount'),
+                origens: { terms: { field: F_SPORT, size: 3, order: { bytes: 'desc' } }, aggs: { bytes: sum('netflow.octetDeltaCount') } }
+              }
+            }
+          }
+        }
+      }
+    });
+    const agg = resp.aggregations?.pares;
+    const page = agg?.buckets || [];
+    if (!page.length) break;
+    buckets.push(...page);
+    after = agg.after_key || null;
+    if (!after) break;
+  }
+  if (after && buckets.length >= maxPairs) {
+    const probe = await searchElastic({ index: ELASTIC_INDEX, size: 0, query: baseQuery, aggs: { pares: { composite: { size: 1, after, sources } } } });
+    truncated = (probe.aggregations?.pares?.buckets || []).length > 0;
+  }
+
+  const totals = await totalsPromise;
+  return {
+    buckets,
+    truncated,
+    totals: {
+      outBytes: totals.aggregations?.saida?.bytes?.value || 0,
+      outPackets: totals.aggregations?.saida?.pacotes?.value || 0,
+      inBytes: totals.aggregations?.entrada?.bytes?.value || 0,
+      inPackets: totals.aggregations?.entrada?.pacotes?.value || 0
+    }
+  };
+}
+
 module.exports = {
+  fetchHostPeers,
+  getPairGraph,
+  fetchIpTraffic,
+  fetchPairCompare,
   client,
   searchElastic,
   elasticSearchStats,
@@ -872,5 +1128,6 @@ module.exports = {
   conversationDirection,
   fetchSessions,
   fetchBeaconProfile,
-  toCytoscape
+  toCytoscape,
+  fetchMapGraph
 };

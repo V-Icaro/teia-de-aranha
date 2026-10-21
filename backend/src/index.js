@@ -1,8 +1,9 @@
 ﻿require('dotenv').config();
 const net = require('node:net');
+const zlib = require('node:zlib');
 const express = require('express');
 const cors = require('cors');
-const { client, searchElastic, elasticSearchStats, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
+const { client, searchElastic, elasticSearchStats, ELASTIC_INDEX, F_SRC, F_DST, F_DPORT, fetchConnections, fetchTopPairs, conversationDirection, fetchSessions, fetchBeaconProfile, toCytoscape, fetchMapGraph, fetchHostPeers, getPairGraph, fetchIpTraffic, fetchPairCompare, rankPorts, protocolName, portName, cidrContains } = require('./elastic');
 const { hostRisk, inboundFlows, newExternalPeers, isPrivate, windowStart } = require('./risk');
 const { topApplications, applicationConnections, topKnownPorts } = require('./dashboard');
 const { subnetOf, resolveMany, resolveIp } = require('./names');
@@ -20,8 +21,9 @@ const {
   listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups
 } = require('./db');
 const { intParam } = require('./params.js');
-const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs } = require('./fortigate.js');
+const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable } = require('./fortigate.js');
 const { analyzePolicies } = require('./firewallAnalysis.js');
+const { auditFortigate } = require('./fortigate-audit.js');
 const cron = require('node-cron');
 const { downloadBackup, saveBackupFile, readBackupFile, deleteBackupFile } = require('./fortigate-backup');
 const { runFortigateBackup } = require('./fortigate-backup');
@@ -60,6 +62,8 @@ const maxEdgesParsed = Number.parseInt(maxEdgesRaw ?? '50000', 10);
 const MAX_EDGES = maxEdgesRaw === '0' ? Infinity : Number.isSafeInteger(maxEdgesParsed) && maxEdgesParsed > 0 ? maxEdgesParsed : 50000;
 const ACTIVE_WINDOW_SEC = parseInt(process.env.ACTIVE_WINDOW_SEC || '120', 10);
 const COMPOSITE_PAGE_SIZE = Math.min(2000, Math.max(100, parseInt(process.env.COMPOSITE_PAGE_SIZE || '1000', 10) || 1000));
+// Pares (src,dst) lidos para o detalhe de um host: ~2 por peer (ida e volta).
+const HOST_MAX_PAIRS = Math.max(1000, parseInt(process.env.HOST_MAX_PAIRS || '40000', 10) || 40000);
 
 
 // Janela efetiva da query, para a resposta dizer a verdade. `minutes` sozinho
@@ -264,6 +268,21 @@ app.get('/api/fortigate/:id/policies', async (req, res) => {
   }
 });
 
+// Lista completa (sem paginação) no formato da "Interface Pair View" do
+// FortiGate: configuração da CMDB + contadores do monitor por política.
+app.get('/api/fortigate/:id/policy-table', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { credentials } = await fortigateCredentials(id);
+    const vdom = String(req.query.vdom || credentials.vdom || 'root').trim() || 'root';
+    res.json(await fetchPolicyTable({ ...credentials, vdom }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar políticas', detail: String(e.message || e) });
+  }
+});
+
 app.get('/api/fortigate/:id/policy/:policyId', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
@@ -275,6 +294,20 @@ app.get('/api/fortigate/:id/policy/:policyId', async (req, res) => {
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar detalhe da política', detail: String(e.message || e) });
+  }
+});
+
+// Auditoria de usuários (admins + tokens de API) e interfaces (serviços de
+// gerência expostos). Somente leitura.
+app.get('/api/fortigate/:id/audit', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
+    const { firewall, credentials } = await fortigateCredentials(id);
+    res.json({ firewall: { id: firewall.id, name: firewall.name, host: firewall.host }, ...(await auditFortigate(credentials)) });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha na auditoria do FortiGate', detail: String(e.message || e) });
   }
 });
 
@@ -454,36 +487,85 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// ---- Mapa de conexões --------------------------------------------------
+// O navegador não desenha dezenas de milhares de arestas: a rota agrega a
+// janela inteira no ES (por par), guarda em cache curto e devolve só as
+// `limit` arestas de maior volume. Trocar o limite, focar uma sub-rede ou
+// reabrir a aba dentro do TTL reaproveita a mesma agregação.
+const MAP_DEFAULT_EDGES = Math.max(100, Number.parseInt(process.env.MAP_DEFAULT_EDGES || '3000', 10) || 3000);
+const MAP_MAX_EDGES_RESPONSE = Math.max(MAP_DEFAULT_EDGES, Number.parseInt(process.env.MAP_MAX_EDGES_RESPONSE || '30000', 10) || 30000);
+// A agregação por par e o cache (MAP_MAX_PAIRS, MAP_PAGE_SIZE, MAP_CACHE_TTL_MS)
+// ficam em elastic.js (getPairGraph): Pares, Dashboard e top talkers reaproveitam.
+
+// Respostas do mapa passam fácil de alguns MB: gzip derruba ~85% do tráfego.
+function sendJson(req, res, payload) {
+  const body = JSON.stringify(payload);
+  if (body.length < 32 * 1024 || !/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
+    return res.type('application/json').send(body);
+  }
+  zlib.gzip(body, { level: 5 }, (err, buf) => {
+    if (err) return res.type('application/json').send(body);
+    res.set({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' });
+    res.send(buf);
+  });
+}
+
 // Grafo principal p/ o React + Cytoscape
-// Ex: /api/graph?minutes=15 | /api/graph?minutes=60 | /api/graph?from=...&to=...
+// Ex: /api/graph?minutes=15 | /api/graph?from=...&to=...
+// ?limit=3000 (0 = máximo permitido) · ?cidr=10.0.0.0/24 · ?ip=10.0.0.5 · ?fresh=1 (ignora cache)
 // ?names=1 — enriquece nós com { name, subnet } via inventário + rDNS
 app.get('/api/graph', async (req, res) => {
+  const startedAt = Date.now();
   try {
-    const buckets = await fetchConnections(req.query, {
-      pageSize: COMPOSITE_PAGE_SIZE,
-      maxEdges: MAX_EDGES
-    });
-    const graph = toCytoscape(buckets);
+    const ip = typeof req.query.ip === 'string' && net.isIP(req.query.ip.trim()) ? req.query.ip.trim() : null;
+    const cidr = typeof req.query.cidr === 'string' && /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(req.query.cidr.trim()) ? req.query.cidr.trim() : null;
+    const limitRaw = String(req.query.limit ?? '');
+    const limit = limitRaw === '0'
+      ? MAP_MAX_EDGES_RESPONSE
+      : Math.min(MAP_MAX_EDGES_RESPONSE, Math.max(100, Number.parseInt(limitRaw || String(MAP_DEFAULT_EDGES), 10) || MAP_DEFAULT_EDGES));
+
+    const { data, cached } = await getPairGraph(req.query, { ip, fresh: req.query.fresh === '1' });
+    // data.edges já vem ordenado por bytes (desc); o filtro preserva a ordem.
+    const scoped = cidr
+      ? data.edges.filter((e) => cidrContains(cidr, e.data.source) || cidrContains(cidr, e.data.target))
+      : data.edges;
+    const shown = scoped.length > limit ? scoped.slice(0, limit) : scoped;
+
+    const allNodes = new Set();
+    for (const e of scoped) { allNodes.add(e.data.source); allNodes.add(e.data.target); }
+    const shownNodes = new Set();
+    for (const e of shown) { shownNodes.add(e.data.source); shownNodes.add(e.data.target); }
+    const nodes = [...shownNodes].map((id) => ({ data: { id, label: id, subnet: subnetOf(id) } }));
+
     if (req.query.names === '1') {
-      const ips = graph.nodes.map((n) => n.data.id);
-      const { names, info } = await resolveMany(ips);
-      for (const n of graph.nodes) {
-        n.data.subnet = subnetOf(n.data.id);
+      const { names, info } = await resolveMany(nodes.map((n) => n.data.id));
+      for (const n of nodes) {
         if (names[n.data.id]) n.data.name = names[n.data.id];
         const extra = info[n.data.id];
         if (extra) { n.data.asn = extra.asn; n.data.org = extra.org; n.data.prefix = extra.prefix; }
         const show = n.data.name || n.data.org;
         if (show) n.data.label = `${show}\n${n.data.id}`;
       }
-    } else {
-      for (const n of graph.nodes) n.data.subnet = subnetOf(n.data.id);
     }
-    res.json({
-      ...graph,
+
+    sendJson(req, res, {
+      nodes,
+      edges: shown,
       meta: {
-        edges: graph.edges.length,
-        nodes: graph.nodes.length,
-        truncated: buckets.truncated || false,
+        edges: shown.length,
+        nodes: nodes.length,
+        totalEdges: scoped.length,
+        totalNodes: allNodes.size,
+        limit,
+        limited: scoped.length > shown.length,
+        // Teto de pares no ES (MAP_MAX_PAIRS) atingido: a própria agregação é parcial.
+        truncated: data.truncated || false,
+        pairs: data.pairs,
+        esPages: data.pages,
+        queryMs: data.queryMs,
+        elapsedMs: Date.now() - startedAt,
+        cached,
+        scope: { cidr, ip },
         minutes: req.query.minutes || null,
         from: req.query.from || null,
         to: req.query.to || null,
@@ -492,7 +574,7 @@ app.get('/api/graph', async (req, res) => {
     });
   } catch (e) {
     if (!e.status) console.error(e);
-    res.status(e.status || 500).json({ error: 'Falha ao consultar Elasticsearch', detail: String(e.message || e) });
+    res.status(e.status || 500).json({ error: e.status === 400 ? e.message : 'Falha ao consultar Elasticsearch', detail: String(e.message || e) });
   }
 });
 
@@ -519,51 +601,59 @@ app.post('/api/resolve', async (req, res) => {
 app.get('/api/host/:ip', async (req, res) => {
   try {
     const { ip } = req.params;
+    if (!net.isIP(String(ip))) return res.status(400).json({ error: 'IP inválido' });
     const activeOnly = req.query.active === '1';
     const nowMs = Date.now();
-    const buckets = await fetchConnections(req.query, {
-      pageSize: COMPOSITE_PAGE_SIZE,
-      maxEdges: MAX_EDGES,
-      ip, // filtra no ES: só fluxos do host + mantém porta_orig (volume pequeno)
-      withSport: true,
-      withTimes: true, // firstSeen/lastSeen por par (coluna ESTADO)
-      activeSec: activeOnly ? ACTIVE_WINDOW_SEC : null
+    const { buckets, truncated, totals } = await fetchHostPeers(req.query, {
+      ip,
+      activeSec: activeOnly ? ACTIVE_WINDOW_SEC : null,
+      maxPairs: HOST_MAX_PAIRS
     });
 
-    const mine = buckets; // já filtrado no ES
-
-    let outBytes = 0;
-    let inBytes = 0;
-    let outPackets = 0;
-    let inPackets = 0;
     const peers = {};
+    const timeOf = (agg) => (agg?.value_as_string ? Date.parse(agg.value_as_string) : (agg?.value || null));
 
-    for (const b of mine) {
+    for (const b of buckets) {
       const bytes = b.bytes?.value || 0;
       const pkts = b.pacotes?.value || 0;
       const isSrc = String(b.key.origem) === ip;
       const peer = isSrc ? String(b.key.destino) : String(b.key.origem);
-      if (isSrc) { outBytes += bytes; outPackets += pkts; }
-      else { inBytes += bytes; inPackets += pkts; }
-      if (!peers[peer]) peers[peer] = { ip: peer, bytes: 0, packets: 0, outBytes: 0, inBytes: 0, firstSeen: null, lastSeen: 0, outPairs: new Map(), inPairs: new Map(), srcPorts: new Set(), dstPorts: new Set(), ports: new Set(), protocols: new Set() };
-      peers[peer].bytes += bytes;
-      peers[peer].packets += pkts;
-      if (isSrc) peers[peer].outBytes += bytes; else peers[peer].inBytes += bytes;
+      if (!peer || peer === ip) continue;
+      if (!peers[peer]) peers[peer] = { ip: peer, bytes: 0, packets: 0, outBytes: 0, inBytes: 0, flows: 0, firstSeen: null, lastSeen: 0, outPairs: new Map(), inPairs: new Map(), srcPorts: new Set(), dstPorts: new Set(), ports: new Set(), protocols: new Set() };
+      const p = peers[peer];
+      p.bytes += bytes;
+      p.packets += pkts;
+      p.flows += b.doc_count || 0;
+      if (isSrc) p.outBytes += bytes; else p.inBytes += bytes;
       // Pares sport→dport por direção (top 5 de cada lado na tabela)
-      const pk = `${b.key.porta_orig ?? '?'}>${b.key.porta_dest ?? '?'}`;
-      const pm = isSrc ? peers[peer].outPairs : peers[peer].inPairs;
-      const pe = pm.get(pk) || { sport: b.key.porta_orig ?? null, dport: b.key.porta_dest ?? null, bytes: 0, flows: 0 };
-      pe.bytes += bytes; pe.flows += b.doc_count || 0;
-      pm.set(pk, pe);
-      const fs = b.firstSeen?.value_as_string ? Date.parse(b.firstSeen.value_as_string) : (b.firstSeen?.value || null);
-      const ls = b.lastSeen?.value_as_string ? Date.parse(b.lastSeen.value_as_string) : (b.lastSeen?.value || null);
-      if (fs && (!peers[peer].firstSeen || fs < peers[peer].firstSeen)) peers[peer].firstSeen = fs;
-      if (ls && ls > peers[peer].lastSeen) peers[peer].lastSeen = ls;
-      if (b.key.porta_orig) { peers[peer].srcPorts.add(b.key.porta_orig); }
-      if (b.key.porta_dest) { peers[peer].dstPorts.add(b.key.porta_dest); peers[peer].ports.add(b.key.porta_dest); }
-      if (b.key.protocolo !== undefined) peers[peer].protocols.add(b.key.protocolo);
+      const pm = isSrc ? p.outPairs : p.inPairs;
+      for (const d of b.portas?.buckets || []) {
+        const dport = d.key ?? null;
+        if (dport != null) { p.dstPorts.add(dport); p.ports.add(dport); }
+        const origins = d.origens?.buckets || [];
+        if (!origins.length) {
+          const pk = `?>${dport}`;
+          const pe = pm.get(pk) || { sport: null, dport, bytes: 0, flows: 0 };
+          pe.bytes += d.bytes?.value || 0; pe.flows += d.doc_count || 0;
+          pm.set(pk, pe);
+        }
+        for (const s of origins) {
+          const sport = s.key ?? null;
+          if (sport != null) p.srcPorts.add(sport);
+          const pk = `${sport}>${dport}`;
+          const pe = pm.get(pk) || { sport, dport, bytes: 0, flows: 0 };
+          pe.bytes += s.bytes?.value || 0; pe.flows += s.doc_count || 0;
+          pm.set(pk, pe);
+        }
+      }
+      const fs = timeOf(b.firstSeen);
+      const ls = timeOf(b.lastSeen);
+      if (fs && (!p.firstSeen || fs < p.firstSeen)) p.firstSeen = fs;
+      if (ls && ls > p.lastSeen) p.lastSeen = ls;
+      for (const pr of b.protocolos?.buckets || []) if (pr.key != null) p.protocols.add(pr.key);
     }
 
+    const peerCount = Object.keys(peers).length;
     const topPairs = (m) => [...m.values()]
       .sort((x, y) => y.bytes - x.bytes).slice(0, 5)
       .map((x) => ({ sport: x.sport, dport: x.dport, bytes: Math.round(x.bytes), flows: x.flows }));
@@ -611,11 +701,14 @@ app.get('/api/host/:ip', async (req, res) => {
       inventory,
       activeOnly,
       windowPeers,
-      truncated: buckets.truncated || false,
-      totalInBytes: Math.round(inBytes),
-      totalOutBytes: Math.round(outBytes),
-      totalInPackets: Math.round(inPackets),
-      totalOutPackets: Math.round(outPackets),
+      // Totais vêm de agregação própria: exatos mesmo se a lista de peers cortar.
+      truncated,
+      peerCount,
+      shownPeers: connections.length,
+      totalInBytes: Math.round(totals.inBytes),
+      totalOutBytes: Math.round(totals.outBytes),
+      totalInPackets: Math.round(totals.inPackets),
+      totalOutPackets: Math.round(totals.outPackets),
       connections
     });
   } catch (e) {
@@ -638,9 +731,14 @@ app.get('/api/alerts', async (req, res) => {
       curFrom = new Date(now - minutes * 60000).toISOString();
     }
 
-    const current = await fetchConnections({ from: curFrom, to: curTo }, {
-      pageSize: COMPOSITE_PAGE_SIZE, maxEdges: MAX_EDGES
-    });
+    // Mesma agregação por par do mapa (cacheada). Janela relativa usa `minutes`
+    // para casar com o cache do mapa; intervalo explícito usa from/to.
+    const { data } = await getPairGraph(req.query.from ? { from: curFrom, to: curTo } : { minutes: String(minutes) });
+    const current = data.edges.map((e) => ({
+      key: { origem: e.data.source, destino: e.data.target },
+      bytes: { value: e.data.bytes },
+      pacotes: { value: e.data.packets }
+    }));
 
     res.json({
       topTalkers: topTalkers(current),
@@ -834,36 +932,16 @@ app.post('/api/reputation', async (req, res) => {
 app.get('/api/ip/:ip', async (req, res) => {
   try {
     const { ip } = req.params;
+    if (!net.isIP(String(ip))) return res.status(400).json({ error: 'IP inválido' });
     await dbInit();
-    const [identity, rep, buckets, inventory] = await Promise.all([
+    const emptyTraffic = { inBytes: 0, outBytes: 0, inPackets: 0, outPackets: 0, flows: 0, truncated: false, topPeers: [], topPorts: [], unavailable: true };
+    const [identity, rep, traffic, inventory] = await Promise.all([
       resolveIp(ip).catch(() => ({ ip, name: null, source: 'none', asn: null, org: null, prefix: null })),
       checkIp(ip).catch(() => ({ ip, verdict: 'unknown', sources: [] })),
-      fetchConnections(req.query, {
-        pageSize: COMPOSITE_PAGE_SIZE,
-        maxEdges: MAX_EDGES,
-        ip,
-        withSport: true
-      }).catch(() => []),
+      // Uma consulta: totais exatos por direção + top peers + top portas.
+      fetchIpTraffic(req.query, ip).catch((e) => { console.warn(`[ip] tráfego de ${ip} indisponível: ${e.message}`); return emptyTraffic; }),
       inventoryApplicationsForIp(ip).catch(() => null)
     ]);
-
-    let inBytes = 0, outBytes = 0, inPackets = 0, outPackets = 0, flows = 0;
-    const peers = {};
-    const dports = {};
-    for (const b of buckets) {
-      const bytes = b.bytes?.value || 0;
-      const pkts = b.pacotes?.value || 0;
-      const isSrc = String(b.key.origem) === ip;
-      const peer = isSrc ? String(b.key.destino) : String(b.key.origem);
-      flows += b.doc_count || 0;
-      if (isSrc) { outBytes += bytes; outPackets += pkts; } else { inBytes += bytes; inPackets += pkts; }
-      const dp = b.key.porta_dest ?? null;
-      dports[dp] = dports[dp] || { port: dp, bytes: 0, flows: 0 };
-      dports[dp].bytes += bytes; dports[dp].flows += b.doc_count || 0;
-      peers[peer] = peers[peer] || { ip: peer, bytes: 0, flows: 0, ports: new Set() };
-      peers[peer].bytes += bytes; peers[peer].flows += b.doc_count || 0;
-      if (dp != null) peers[peer].ports.add(dp);
-    }
 
     res.json({
       ip,
@@ -877,18 +955,11 @@ app.get('/api/ip/:ip', async (req, res) => {
       inventory,
       reputation: rep,
       traffic: {
-        inBytes: Math.round(inBytes),
-        outBytes: Math.round(outBytes),
-        inPackets: Math.round(inPackets),
-        outPackets: Math.round(outPackets),
-        flows,
-        truncated: buckets.truncated || false,
-        topPeers: Object.values(peers)
-          .map((p) => ({ ip: p.ip, bytes: Math.round(p.bytes), flows: p.flows, ports: [...p.ports].slice(0, 10) }))
-          .sort((a, b) => b.bytes - a.bytes).slice(0, 10),
-        topPorts: Object.values(dports)
-          .map((d) => ({ port: d.port, bytes: Math.round(d.bytes), flows: d.flows }))
-          .sort((a, b) => b.bytes - a.bytes).slice(0, 10)
+        ...traffic,
+        inBytes: Math.round(traffic.inBytes),
+        outBytes: Math.round(traffic.outBytes),
+        inPackets: Math.round(traffic.inPackets),
+        outPackets: Math.round(traffic.outPackets)
       }
     });
   } catch (e) {
@@ -909,54 +980,26 @@ app.get('/api/compare', async (req, res) => {
     const to = req.query.to || new Date(now).toISOString();
     const from = req.query.from || new Date(now - minutes * 60000).toISOString();
 
-    // Fluxos do par (1 consulta filtrada em A, fatia o peer B no código)
-    const buckets = await fetchConnections({ from, to }, {
-      pageSize: COMPOSITE_PAGE_SIZE, maxEdges: MAX_EDGES, ip: a, withSport: true
-    });
-    const pair = buckets.filter((x) => String(x.key.origem) === b || String(x.key.destino) === b);
+    if (!net.isIP(String(a)) || !net.isIP(String(b))) return res.status(400).json({ error: 'Informe dois IPs válidos' });
 
-    const dir = {
-      aToB: { bytes: 0, packets: 0, flows: 0, ports: {} },
-      bToA: { bytes: 0, packets: 0, flows: 0, ports: {} }
-    };
-    for (const x of pair) {
-      const fwd = String(x.key.origem) === a; // A->B ?
-      const d = fwd ? dir.aToB : dir.bToA;
-      const bytes = x.bytes?.value || 0;
-      d.bytes += bytes; d.packets += x.pacotes?.value || 0; d.flows += x.doc_count || 0;
-      const p = x.key.porta_dest ?? 'null';
-      d.ports[p] = d.ports[p] || { port: x.key.porta_dest ?? null, bytes: 0, flows: 0 };
-      d.ports[p].bytes += bytes; d.ports[p].flows += x.doc_count || 0;
-    }
+    // Uma consulta só, já filtrada no par: direções, top portas e timeline.
+    // Intervalo pelo tamanho REAL da janela (from/to pode vir do front).
+    const spanMin = Math.max(1, (Date.parse(to) - Date.parse(from)) / 60000 || minutes);
+    const interval = spanMin <= 30 ? '1m' : spanMin <= 180 ? '5m' : spanMin <= 720 ? '15m' : '1h';
+    const agg = await fetchPairCompare({ a, b, from, to, interval });
     const fmtDir = (d) => ({
-      bytes: Math.round(d.bytes), packets: Math.round(d.packets), flows: d.flows,
-      topPorts: Object.values(d.ports).map((p) => ({ port: p.port, bytes: Math.round(p.bytes), flows: p.flows }))
-        .sort((x, y) => y.bytes - x.bytes).slice(0, 10)
+      bytes: Math.round(d?.bytes?.value || 0),
+      packets: Math.round(d?.pacotes?.value || 0),
+      flows: d?.doc_count || 0,
+      topPorts: (d?.portas?.buckets || []).map((p) => ({ port: p.key ?? null, bytes: Math.round(p.bytes?.value || 0), flows: p.doc_count || 0 }))
     });
-
-    // Timeline: 1 consulta com 2 filtros (A->B e B->A)
-    const interval = minutes <= 30 ? '1m' : minutes <= 180 ? '5m' : minutes <= 720 ? '15m' : '1h';
-    const range = { '@timestamp': { gte: from, lte: to } };
-    const t = await searchElastic({ index: ELASTIC_INDEX, size: 0, query: { bool: { filter: [{ range }] } },
-      aggs: {
-        aToB: { filter: { bool: { filter: [
-          { term: { [process.env.ELASTIC_FIELD_SRC || 'netflow.sourceIPv4Address.keyword']: a } },
-          { term: { [process.env.ELASTIC_FIELD_DST || 'netflow.destinationIPv4Address.keyword']: b } }
-        ] } }, aggs: { over: { date_histogram: { field: '@timestamp', fixed_interval: interval },
-          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } } } },
-        bToA: { filter: { bool: { filter: [
-          { term: { [process.env.ELASTIC_FIELD_SRC || 'netflow.sourceIPv4Address.keyword']: b } },
-          { term: { [process.env.ELASTIC_FIELD_DST || 'netflow.destinationIPv4Address.keyword']: a } }
-        ] } }, aggs: { over: { date_histogram: { field: '@timestamp', fixed_interval: interval },
-          aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } } } }
-      } });
-    const ba = Object.fromEntries(t.aggregations.bToA.over.buckets.map((x) => [x.key, Math.round(x.bytes.value || 0)]));
-    const timeline = t.aggregations.aToB.over.buckets.map((x) => ({
-      t: x.key_as_string, aToB: Math.round(x.bytes.value || 0), bToA: ba[x.key] || 0
+    const ba = Object.fromEntries((agg.bToA?.over?.buckets || []).map((x) => [x.key, Math.round(x.bytes?.value || 0)]));
+    const timeline = (agg.aToB?.over?.buckets || []).map((x) => ({
+      t: x.key_as_string, aToB: Math.round(x.bytes?.value || 0), bToA: ba[x.key] || 0
     }));
 
-    res.json({ a, b, from, to, interval, truncated: buckets.truncated || false,
-      aToB: fmtDir(dir.aToB), bToA: fmtDir(dir.bToA), timeline });
+    res.json({ a, b, from, to, interval, truncated: false,
+      aToB: fmtDir(agg.aToB), bToA: fmtDir(agg.bToA), timeline });
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: 'Falha ao comparar', detail: String(e.message || e) });
@@ -1246,6 +1289,7 @@ app.get('/api/lookup', async (req, res) => {
   try {
     const ip = (req.query.ip || '').trim();
     if (!ip) return res.status(400).json({ error: 'Envie ?ip=IP' });
+    if (!net.isIP(ip)) return res.status(400).json({ error: 'IP inválido' });
     const days = intParam(req.query.days, { nome: 'days', def: 7, min: 1, max: 7 });
     const base = [
       { range: { '@timestamp': { gte: `now-${days}d` } } },
@@ -1253,7 +1297,9 @@ app.get('/api/lookup', async (req, res) => {
     ];
     const peerAggs = (field) => ({ terms: { field, size: 20 },
       aggs: { bytes: { sum: { field: 'netflow.octetDeltaCount' } } } });
-    const r = await searchElastic({ index: ELASTIC_INDEX, size: 0,
+    // track_total_hits: sem ele o ES para de contar em 10.000 e a tela
+    // mostrava "10000 fluxos" para qualquer IP movimentado.
+    const r = await searchElastic({ index: ELASTIC_INDEX, size: 0, track_total_hits: true,
       query: { bool: { filter: base } },
       aggs: {
         first: { min: { field: '@timestamp' } },

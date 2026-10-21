@@ -305,4 +305,88 @@ async function fetchPolicyConfigs({ host, token, vdom = 'root' }) {
   };
 }
 
-module.exports = { fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, normalizePolicy, normalizePolicyDetail };
+// Perfis de segurança na ordem em que o FortiGate os exibe na lista.
+const SECURITY_PROFILE_FIELDS = [
+  ['avProfile', 'AV'],
+  ['webfilterProfile', 'Web'],
+  ['dnsfilterProfile', 'DNS'],
+  ['applicationList', 'App'],
+  ['ipsSensor', 'IPS'],
+  ['emailfilterProfile', 'Email'],
+  ['sslSshProfile', 'SSL']
+];
+
+function profileName(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'object') return value.name || null;
+  return String(value);
+}
+
+function securityProfilesOf(security) {
+  if (!security || security.utmStatus !== 'enable') return [];
+  if (security.profileType === 'group' && security.profileGroup) {
+    return [{ type: 'Grupo', name: profileName(security.profileGroup) }];
+  }
+  return SECURITY_PROFILE_FIELDS
+    .map(([key, type]) => ({ type, name: profileName(security[key]) }))
+    .filter((p) => p.name);
+}
+
+// Visão "Interface Pair View" do FortiGate: configuração da CMDB (interfaces,
+// endereços, serviço, ação, NAT, perfis, log) + contadores do monitor, na
+// ordem efetiva da lista. O agrupamento por par de interfaces fica na tela.
+async function fetchPolicyTable({ host, token, vdom = 'root' }) {
+  const [configs, stats] = await Promise.all([
+    fetchPolicyConfigs({ host, token, vdom }),
+    fetchPolicies({ host, token, vdom })
+  ]);
+  const statsById = new Map(stats.policies.map((s) => [s.policyid, s]));
+  const policies = configs.configs.map((c) => {
+    const s = statsById.get(c.policyid) || {};
+    const flow = c.flow || {};
+    const services = c.services || {};
+    const usesInternetService = flow.internetService === 'enable';
+    return {
+      policyid: c.policyid,
+      position: c.position,
+      name: c.name,
+      comments: c.comments,
+      status: c.status || 'enable',
+      action: c.action || null,
+      schedule: c.schedule || null,
+      srcintf: flow.srcintf || [],
+      dstintf: flow.dstintf || [],
+      srcaddr: [...(flow.srcaddr || []), ...(flow.srcaddr6 || [])],
+      dstaddr: usesInternetService
+        ? (flow.internetServiceName || [])
+        : [...(flow.dstaddr || []), ...(flow.dstaddr6 || [])],
+      srcaddrNegate: flow.srcaddrNegate === 'enable',
+      dstaddrNegate: flow.dstaddrNegate === 'enable',
+      internetService: usesInternetService,
+      service: usesInternetService ? [] : (services.service || []),
+      serviceNegate: services.serviceNegate === 'enable',
+      nat: services.nat === 'enable',
+      ippool: services.ippool === 'enable',
+      poolname: services.poolname || [],
+      securityProfiles: securityProfilesOf(c.security),
+      logtraffic: c.security?.logtraffic || null,
+      hitCount: s.hitCount ?? 0,
+      bytes: s.bytes ?? 0,
+      packets: s.packets ?? 0,
+      activeSessions: s.activeSessions ?? 0,
+      sessionCount: s.sessionCount ?? 0,
+      firstUsed: s.firstUsed ?? null,
+      lastUsed: s.lastUsed ?? null,
+      hasStats: statsById.has(c.policyid)
+    };
+  });
+  return {
+    vdom: configs.vdom || stats.vdom || vdom,
+    version: stats.version,
+    revision: configs.revision,
+    total: policies.length,
+    policies
+  };
+}
+
+module.exports = { requestJson, fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, normalizePolicy, normalizePolicyDetail };
