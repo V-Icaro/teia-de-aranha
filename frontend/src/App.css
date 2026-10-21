@@ -1144,7 +1144,7 @@ button.ghost.fgt-btn-danger:hover:not(:disabled) { border-color: #e4bfc0; backgr
 .fgt-form-heading h3 { margin: 0; color: #263a30; font-size: 14px; }
 .fgt-form-heading p { margin: 0; font-size: 10.5px; }
 .fortigate-step { color: #25885b; font-size: 9px; font-weight: 750; letter-spacing: 1px; }
-.fgt-form { display: grid; grid-template-columns: repeat(3,minmax(140px,1fr)) auto; align-items: end; gap: 10px; }
+.fgt-form { display: grid; grid-template-columns: minmax(140px,1fr) minmax(150px,1.1fr) 96px minmax(150px,1fr) auto; align-items: end; gap: 10px; }
 .fgt-form-actions { display: flex; gap: 6px; }
 .fgt-form-actions button { min-height: 34px; white-space: nowrap; }
 .fortigate-field { display: grid; min-width: 0; gap: 4px; color: #596761; font-size: 10px; font-weight: 650; }

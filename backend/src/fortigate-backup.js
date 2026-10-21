@@ -10,7 +10,9 @@ function formatDate(d) {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
-function downloadBackup(host, token, { timeoutMs = DEFAULT_TIMEOUT_MS, vdom = 'root', scope = 'global' } = {}) {
+const DEFAULT_PORT = Number.parseInt(process.env.FORTIGATE_PORT || '443', 10) || 443;
+
+function downloadBackup(host, token, { timeoutMs = DEFAULT_TIMEOUT_MS, vdom = 'root', scope = 'global', port } = {}) {
   return new Promise((resolve, reject) => {
     const vdomName = String(vdom || 'root').trim() || 'root';
     const headers = { Accept: '*/*', Authorization: `Bearer ${String(token).trim()}` };
@@ -20,7 +22,7 @@ function downloadBackup(host, token, { timeoutMs = DEFAULT_TIMEOUT_MS, vdom = 'r
     const scopeParam = encodeURIComponent(scope || 'global');
     const req = https.request({
       host,
-      port: Number.parseInt(process.env.FORTIGATE_PORT || '443', 10),
+      port: Number(port) || DEFAULT_PORT,
       path: `/api/v2/monitor/system/config/backup?scope=${scopeParam}`,
       method: 'POST',
       rejectUnauthorized: false,
@@ -40,7 +42,7 @@ function downloadBackup(host, token, { timeoutMs = DEFAULT_TIMEOUT_MS, vdom = 'r
       });
     });
     req.on('timeout', () => req.destroy(Object.assign(new Error('Tempo esgotado ao baixar backup do FortiGate'), { status: 504 })));
-    req.on('error', (e) => reject(Object.assign(new Error(`Falha de conexão com o FortiGate: ${e.message}`), { status: 502 })));
+    req.on('error', (e) => reject(Object.assign(new Error(`Falha de conexão com o FortiGate (porta ${Number(port) || DEFAULT_PORT}): ${e.message}`), { status: 502 })));
     req.write('');
     req.end();
   });
@@ -73,7 +75,7 @@ async function runFortigateBackup({ fortigate, policyId = null, retentionDays = 
   if (!fg) throw Object.assign(new Error('FortiGate não informado'), { status: 400 });
   const record = await db.createFortigateBackupRecord({ fortigateId: fg.id, policyId });
   try {
-    const buffer = await downloadBackup(fg.host, fg.token, { vdom: fg.vdom || 'root' });
+    const buffer = await downloadBackup(fg.host, fg.token, { vdom: fg.vdom || 'root', port: fg.port });
     const saved = await saveBackupFile(fg, buffer);
     await db.updateFortigateBackupRecord(record.id, {
       status: 'success',

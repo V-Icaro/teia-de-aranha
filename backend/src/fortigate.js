@@ -13,11 +13,15 @@ const POLICY_PATH = '/api/v2/monitor/firewall/policy';
 const CMDB_POLICY_PATH = '/api/v2/cmdb/firewall/policy';
 const DEFAULT_TIMEOUT_MS = Math.max(1000, Number.parseInt(process.env.FORTIGATE_TIMEOUT_MS || '8000', 10));
 
-function requestJson(host, path, token, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+// Porta HTTPS de administração: a do cadastro do firewall; FORTIGATE_PORT
+// (env) só como padrão para quem chamar sem porta.
+const DEFAULT_PORT = Number.parseInt(process.env.FORTIGATE_PORT || '443', 10) || 443;
+
+function requestJson(host, path, token, { timeoutMs = DEFAULT_TIMEOUT_MS, port } = {}) {
   return new Promise((resolve, reject) => {
     const req = https.request({
       host,
-      port: Number.parseInt(process.env.FORTIGATE_PORT || '443', 10),
+      port: Number(port) || DEFAULT_PORT,
       path,
       method: 'GET',
       rejectUnauthorized: false,
@@ -56,7 +60,13 @@ function requestJson(host, path, token, { timeoutMs = DEFAULT_TIMEOUT_MS } = {})
       });
     });
     req.on('timeout', () => req.destroy(Object.assign(new Error('Tempo esgotado ao falar com o FortiGate'), { status: 504 })));
-    req.on('error', (e) => reject(Object.assign(new Error(`Falha de conexão com o FortiGate: ${e.message}`), { status: e.status || 502 })));
+    req.on('error', (e) => {
+      // Porta errada costuma aparecer como recusa/timeout/reset: diz qual porta foi tentada.
+      const hint = ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EPROTO'].includes(e.code)
+        ? ` (porta ${Number(port) || DEFAULT_PORT}: confira a porta HTTPS de administração — admin-sport — no cadastro)`
+        : '';
+      reject(Object.assign(new Error(`Falha de conexão com o FortiGate: ${e.message}${hint}`), { status: e.status || 502 }));
+    });
     req.end();
   });
 }
@@ -123,9 +133,9 @@ function normalizePolicy(policy, position = null) {
   };
 }
 
-async function fetchPolicies({ host, token, vdom = 'root' }) {
+async function fetchPolicies({ host, token, vdom = 'root', port }) {
   const path = `${POLICY_PATH}?vdom=${encodeURIComponent(vdom || 'root')}`;
-  const json = await requestJson(host, path, token);
+  const json = await requestJson(host, path, token, { port });
   const results = Array.isArray(json?.results) ? json.results : Array.isArray(json) ? json : [];
   return {
     status: json?.status || null,
@@ -278,9 +288,9 @@ function normalizePolicyDetail(d) {
 }
 
 // GET /api/v2/cmdb/firewall/policy/{id}?vdom=root — configuração completa da regra.
-async function fetchPolicyDetail({ host, token, policyId, vdom = 'root' }) {
+async function fetchPolicyDetail({ host, token, policyId, vdom = 'root', port }) {
   const path = `${CMDB_POLICY_PATH}/${policyId}?vdom=${encodeURIComponent(vdom)}`;
-  const json = await requestJson(host, path, token);
+  const json = await requestJson(host, path, token, { port });
   const policy = Array.isArray(json?.results) ? json.results[0] : json;
   return {
     httpStatus: json?.http_status ?? null,
@@ -293,9 +303,9 @@ async function fetchPolicyDetail({ host, token, policyId, vdom = 'root' }) {
 
 // GET /api/v2/cmdb/firewall/policy?vdom=root — todas as políticas, na ordem
 // efetiva da lista (a posição real da ACL, que o policyid NÃO representa).
-async function fetchPolicyConfigs({ host, token, vdom = 'root' }) {
+async function fetchPolicyConfigs({ host, token, vdom = 'root', port }) {
   const path = `${CMDB_POLICY_PATH}?vdom=${encodeURIComponent(vdom)}`;
-  const json = await requestJson(host, path, token);
+  const json = await requestJson(host, path, token, { port });
   const results = Array.isArray(json?.results) ? json.results : [];
   return {
     status: json?.status ?? null,
@@ -335,10 +345,10 @@ function securityProfilesOf(security) {
 // Visão "Interface Pair View" do FortiGate: configuração da CMDB (interfaces,
 // endereços, serviço, ação, NAT, perfis, log) + contadores do monitor, na
 // ordem efetiva da lista. O agrupamento por par de interfaces fica na tela.
-async function fetchPolicyTable({ host, token, vdom = 'root' }) {
+async function fetchPolicyTable({ host, token, vdom = 'root', port }) {
   const [configs, stats] = await Promise.all([
-    fetchPolicyConfigs({ host, token, vdom }),
-    fetchPolicies({ host, token, vdom })
+    fetchPolicyConfigs({ host, token, vdom, port }),
+    fetchPolicies({ host, token, vdom, port })
   ]);
   const statsById = new Map(stats.policies.map((s) => [s.policyid, s]));
   const policies = configs.configs.map((c) => {

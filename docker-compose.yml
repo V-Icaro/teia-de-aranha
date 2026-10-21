@@ -32,6 +32,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       PORT: ${PORT:-3001}
       NODE_ENV: ${NODE_ENV:-production}
+      FORTIGATE_KEY: "cfdb28562ef6b75683d056266d99eb213b33599851f08be2e55770bd802e81ae"
     volumes:
       - ./backend/storage:/app/storage
     ports:

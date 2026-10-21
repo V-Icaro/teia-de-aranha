@@ -144,6 +144,11 @@ async function init() {
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        -- Porta HTTPS de administração (muitos FortiGates usam admin-sport ≠ 443).
+        ALTER TABLE fortigate ADD COLUMN IF NOT EXISTS port INTEGER NOT NULL DEFAULT 443;
+        DO $$ BEGIN
+          ALTER TABLE fortigate ADD CONSTRAINT fortigate_port_range CHECK (port BETWEEN 1 AND 65535);
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
       `);
     } finally {
       c.release();
@@ -432,49 +437,73 @@ async function deleteExpectedApplicationClient(id) {
 
 function fortigatePublic(row) {
   return {
-    id: Number(row.id), name: row.name, host: row.host, vdom: row.vdom || 'root',
+    id: Number(row.id), name: row.name, host: row.host, port: Number(row.port) || 443, vdom: row.vdom || 'root',
     hasToken: Boolean(row.token_cipher),
     createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
 
+function cleanPort(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw Object.assign(new Error('Porta inválida: use um número entre 1 e 65535.'), { status: 400 });
+  }
+  return n;
+}
+
+// Aceita "fw.empresa.com", "10.0.0.1", "10.0.0.1:8443", "https://fw:4443/",
+// "[2001:db8::1]:8443" e IPv6 puro. Porta escrita no host vale se o campo
+// porta não for informado; com os dois, o campo porta manda.
+function splitHostPort(raw) {
+  let s = String(raw || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+  let port = null;
+  const v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(s);
+  if (v6) { s = v6[1]; port = v6[2] ? Number(v6[2]) : null; }
+  else if ((s.match(/:/g) || []).length === 1) {
+    const [h, p] = s.split(':');
+    if (/^\d+$/.test(p)) { s = h; port = Number(p); }
+  }
+  return { host: s, port };
+}
+
+const FORTIGATE_COLS = 'id, name, host, port, vdom, token_cipher, created_at, updated_at';
+
 async function listFortigates() {
-  const { rows } = await pool.query(
-    `select id, name, host, vdom, token_cipher, created_at, updated_at
-       from fortigate order by lower(name), id`
-  );
+  const { rows } = await pool.query(`select ${FORTIGATE_COLS} from fortigate order by lower(name), id`);
   return rows.map(fortigatePublic);
 }
 
 async function getFortigate(id) {
   const { rows } = await pool.query(
-    `select id, name, host, vdom, token_cipher, token_iv, token_tag, created_at, updated_at
-       from fortigate where id = $1`, [id]
+    `select ${FORTIGATE_COLS}, token_iv, token_tag from fortigate where id = $1`, [id]
   );
   const row = rows[0];
   if (!row) return null;
   return { ...fortigatePublic(row), token: decrypt({ ciphertext: row.token_cipher, iv: row.token_iv, tag: row.token_tag }) };
 }
 
-async function createFortigate({ name, host, vdom = 'root', token }) {
+async function createFortigate({ name, host, port, vdom = 'root', token }) {
   const cleanName = String(name || '').trim();
-  const cleanHost = String(host || '').trim();
+  const parsed = splitHostPort(host);
+  const cleanHost = parsed.host;
   const cleanVdom = String(vdom || 'root').trim() || 'root';
   const cleanToken = String(token || '').trim();
   if (!cleanName || !cleanHost || !cleanToken) {
     throw Object.assign(new Error('Nome, host e token são obrigatórios.'), { status: 400 });
   }
+  const finalPort = cleanPort(port) ?? cleanPort(parsed.port) ?? 443;
   const secret = encrypt(cleanToken);
   const { rows } = await pool.query(
-    `insert into fortigate (name, host, vdom, token_cipher, token_iv, token_tag)
-     values ($1, $2, $3, $4, $5, $6)
-     returning id, name, host, vdom, token_cipher, created_at, updated_at`,
-    [cleanName, cleanHost, cleanVdom, secret.ciphertext, secret.iv, secret.tag]
+    `insert into fortigate (name, host, port, vdom, token_cipher, token_iv, token_tag)
+     values ($1, $2, $3, $4, $5, $6, $7)
+     returning ${FORTIGATE_COLS}`,
+    [cleanName, cleanHost, finalPort, cleanVdom, secret.ciphertext, secret.iv, secret.tag]
   );
   return fortigatePublic(rows[0]);
 }
 
-async function updateFortigate(id, { name, host, vdom, token }) {
+async function updateFortigate(id, { name, host, port, vdom, token }) {
   const current = await pool.query('select id from fortigate where id = $1', [id]);
   if (!current.rowCount) throw Object.assign(new Error('FortiGate não encontrado.'), { status: 404 });
   const sets = [];
@@ -484,11 +513,15 @@ async function updateFortigate(id, { name, host, vdom, token }) {
     if (!clean) throw Object.assign(new Error('Nome não pode ficar vazio.'), { status: 400 });
     values.push(clean); sets.push(`name = $${values.length}`);
   }
+  let hostPort = null;
   if (host !== undefined) {
-    const clean = String(host || '').trim();
-    if (!clean) throw Object.assign(new Error('Host não pode ficar vazio.'), { status: 400 });
-    values.push(clean); sets.push(`host = $${values.length}`);
+    const parsed = splitHostPort(host);
+    if (!parsed.host) throw Object.assign(new Error('Host não pode ficar vazio.'), { status: 400 });
+    values.push(parsed.host); sets.push(`host = $${values.length}`);
+    hostPort = parsed.port;
   }
+  const newPort = cleanPort(port) ?? cleanPort(hostPort);
+  if (newPort != null) { values.push(newPort); sets.push(`port = $${values.length}`); }
   if (vdom !== undefined) {
     const clean = String(vdom || 'root').trim() || 'root';
     values.push(clean); sets.push(`vdom = $${values.length}`);
@@ -503,7 +536,7 @@ async function updateFortigate(id, { name, host, vdom, token }) {
   values.push(id);
   const { rows } = await pool.query(
     `update fortigate set ${sets.join(', ')}, updated_at = now() where id = $${values.length}
-     returning id, name, host, vdom, token_cipher, created_at, updated_at`, values
+     returning ${FORTIGATE_COLS}`, values
   );
   return fortigatePublic(rows[0]);
 }
@@ -757,5 +790,6 @@ module.exports = {
   listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
   ensureFortigateBackupSchema,
   listFortigateBackupPolicies, createFortigateBackupPolicy, updateFortigateBackupPolicy, deleteFortigateBackupPolicy, getFortigateBackupPolicyTargets,
-  listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups, fixStuckFortigateBackups
+  listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups, fixStuckFortigateBackups,
+  _splitHostPort: splitHostPort
 };

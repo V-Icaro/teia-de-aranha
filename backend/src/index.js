@@ -197,7 +197,7 @@ app.get('/api/fortigate', async (_req, res) => {
 app.post('/api/fortigate', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
-    const firewall = await createFortigate({ name: req.body?.name, host: req.body?.host, vdom: req.body?.vdom, token: req.body?.token });
+    const firewall = await createFortigate({ name: req.body?.name, host: req.body?.host, port: req.body?.port, vdom: req.body?.vdom, token: req.body?.token });
     res.status(201).json({ firewall });
   } catch (e) {
     if (!e.status) console.error(e);
@@ -213,6 +213,7 @@ app.patch('/api/fortigate/:id', async (req, res) => {
       ...(req.body?.name !== undefined ? { name: req.body.name } : {}),
       ...(req.body?.host !== undefined ? { host: req.body.host } : {}),
       ...(req.body?.vdom !== undefined ? { vdom: req.body.vdom } : {}),
+      ...(req.body?.port !== undefined ? { port: req.body.port } : {}),
       ...(req.body?.token !== undefined ? { token: req.body.token } : {})
     });
     res.json({ firewall });
@@ -236,7 +237,7 @@ app.delete('/api/fortigate/:id', async (req, res) => {
 async function fortigateCredentials(id) {
   const firewall = await getFortigate(id);
   if (!firewall) throw Object.assign(new Error('FortiGate não encontrado.'), { status: 404 });
-  return { firewall, credentials: { host: firewall.host, token: firewall.token, vdom: firewall.vdom || 'root' } };
+  return { firewall, credentials: { host: firewall.host, port: firewall.port || 443, token: firewall.token, vdom: firewall.vdom || 'root' } };
 }
 
 app.post('/api/fortigate/:id/test', async (req, res) => {
@@ -245,7 +246,7 @@ app.post('/api/fortigate/:id/test', async (req, res) => {
     const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
     const { firewall, credentials } = await fortigateCredentials(id);
     const result = await fetchPolicies(credentials);
-    res.json({ ok: true, id, name: firewall.name, host: firewall.host, version: result.version, vdom: result.vdom, policies: result.policies.length });
+    res.json({ ok: true, id, name: firewall.name, host: firewall.host, port: credentials.port, version: result.version, vdom: result.vdom, policies: result.policies.length });
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao testar FortiGate', detail: String(e.message || e) });
@@ -384,7 +385,7 @@ app.post('/api/fortigate/:id/backup', async (req, res) => {
     await ensureFortigateBackupSchema();
     const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
     const { firewall, credentials } = await fortigateCredentials(id);
-    const record = await runFortigateBackup({ fortigate: { id: firewall.id, name: firewall.name, host: credentials.host, token: credentials.token, vdom: credentials.vdom }, policyId: null, retentionDays: Number(req.body?.retentionDays || 30) });
+    const record = await runFortigateBackup({ fortigate: { id: firewall.id, name: firewall.name, host: credentials.host, port: credentials.port, token: credentials.token, vdom: credentials.vdom }, policyId: null, retentionDays: Number(req.body?.retentionDays || 30) });
     res.json({ backup: record });
   } catch (e) {
     if (!e.status) console.error(e);
@@ -406,7 +407,9 @@ app.post('/api/fortigate-backup/policies/:id/run', async (req, res) => {
       try {
         const fg = await getFortigate(t.fortigate_id);
         if (!fg) throw new Error('FortiGate não encontrado');
-        const rec = await runFortigateBackup({ fortigate: fg, policyId, retentionDays: policy.retention_days });
+        // listFortigateBackupPolicies devolve camelCase: retention_days vinha undefined e a
+        // retenção da política era ignorada (caía no padrão de 30 dias).
+        const rec = await runFortigateBackup({ fortigate: fg, policyId, retentionDays: policy.retentionDays });
         results.push({ fortigateId: fg.id, ok: true, backup: rec });
       } catch (e) {
         results.push({ fortigateId: t.fortigate_id, ok: false, error: e.message });

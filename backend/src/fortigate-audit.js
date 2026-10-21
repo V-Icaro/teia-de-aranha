@@ -629,9 +629,9 @@ function auditSslVpn(settings, sessions) {
   };
 }
 
-async function readTable(host, token, path) {
+async function readTable(host, token, path, port) {
   try {
-    const json = await requestJson(host, path, token);
+    const json = await requestJson(host, path, token, { port });
     return { rows: Array.isArray(json?.results) ? json.results : [], raw: json?.results ?? null, error: null, version: json?.version || null };
   } catch (e) {
     const msg = e.status === 403 ? 'o token não tem permissão de leitura nesta tabela (perfil precisa de leitura em Sistema)'
@@ -643,20 +643,20 @@ async function readTable(host, token, path) {
 
 const bySev = (a, b) => (SEV_ORDER[b.severity] || 0) - (SEV_ORDER[a.severity] || 0) || String(a.name).localeCompare(String(b.name));
 
-async function auditFortigate({ host, token }) {
+async function auditFortigate({ host, token, port }) {
   const [admins, apiUsers, interfaces, ifaceStats, localUsers, userGroups, authUsers, p1, p2, ipsecMon, sslSettings, sslMon] = await Promise.all([
-    readTable(host, token, '/api/v2/cmdb/system/admin'),
-    readTable(host, token, '/api/v2/cmdb/system/api-user'),
-    readTable(host, token, '/api/v2/cmdb/system/interface'),
-    readTable(host, token, '/api/v2/monitor/system/interface?include_vlan=true&include_aggregate=true'),
-    readTable(host, token, '/api/v2/cmdb/user/local'),
-    readTable(host, token, '/api/v2/cmdb/user/group'),
-    readTable(host, token, '/api/v2/monitor/user/firewall'),
-    readTable(host, token, '/api/v2/cmdb/vpn.ipsec/phase1-interface'),
-    readTable(host, token, '/api/v2/cmdb/vpn.ipsec/phase2-interface'),
-    readTable(host, token, '/api/v2/monitor/vpn/ipsec'),
-    readTable(host, token, '/api/v2/cmdb/vpn.ssl/settings'),
-    readTable(host, token, '/api/v2/monitor/vpn/ssl')
+    readTable(host, token, '/api/v2/cmdb/system/admin', port),
+    readTable(host, token, '/api/v2/cmdb/system/api-user', port),
+    readTable(host, token, '/api/v2/cmdb/system/interface', port),
+    readTable(host, token, '/api/v2/monitor/system/interface?include_vlan=true&include_aggregate=true', port),
+    readTable(host, token, '/api/v2/cmdb/user/local', port),
+    readTable(host, token, '/api/v2/cmdb/user/group', port),
+    readTable(host, token, '/api/v2/monitor/user/firewall', port),
+    readTable(host, token, '/api/v2/cmdb/vpn.ipsec/phase1-interface', port),
+    readTable(host, token, '/api/v2/cmdb/vpn.ipsec/phase2-interface', port),
+    readTable(host, token, '/api/v2/monitor/vpn/ipsec', port),
+    readTable(host, token, '/api/v2/cmdb/vpn.ssl/settings', port),
+    readTable(host, token, '/api/v2/monitor/vpn/ssl', port)
   ]);
   // Sem nenhuma tabela legível não há o que mostrar: devolve o erro de verdade.
   if ([admins, apiUsers, interfaces, localUsers, userGroups].every((t) => t.error)) {

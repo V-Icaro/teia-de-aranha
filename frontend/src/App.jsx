@@ -180,7 +180,7 @@ function FortigatePage() {
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState({ name: '', host: '', vdom: 'root', token: '' });
+  const [form, setForm] = useState({ name: '', host: '', port: '443', vdom: 'root', token: '' });
   const [formOpen, setFormOpen] = useState(false);
   const [detail, setDetail] = useState(null);
   const [analysis, setAnalysis] = useState(null);
@@ -212,19 +212,19 @@ function FortigatePage() {
   function resetForm() {
     setEditingId(null);
     setFormOpen(false);
-    setForm({ name: '', host: '', vdom: 'root', token: '' });
+    setForm({ name: '', host: '', port: '443', vdom: 'root', token: '' });
   }
 
   function openNewForm() {
     if (formOpen && !editingId) return resetForm();
     setEditingId(null);
-    setForm({ name: '', host: '', vdom: 'root', token: '' });
+    setForm({ name: '', host: '', port: '443', vdom: 'root', token: '' });
     setFormOpen(true);
   }
 
   function openEditForm(firewall) {
     setEditingId(firewall.id);
-    setForm({ name: firewall.name, host: firewall.host, vdom: firewall.vdom || 'root', token: '' });
+    setForm({ name: firewall.name, host: firewall.host, port: String(firewall.port || 443), vdom: firewall.vdom || 'root', token: '' });
     setFormOpen(true);
   }
 
@@ -352,7 +352,12 @@ function FortigatePage() {
           </div>
           <form className="fgt-form" onSubmit={saveFirewall}>
             <label className="fortigate-field"><span>Nome de identificação</span><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex.: FGT-Matriz" required /></label>
-            <label className="fortigate-field"><span>Endereço do equipamento</span><input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} placeholder="IP ou hostname" required /></label>
+            <label className="fortigate-field"><span>Endereço do equipamento</span><input value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} onBlur={() => {
+              // "10.0.0.1:8443" ou "https://fw:4443/" colado no host: separa a porta.
+              const m = /^(?:https?:\/\/)?([^/:[\]]+):(\d{1,5})\/?$/.exec(form.host.trim());
+              if (m) setForm((f) => ({ ...f, host: m[1], port: m[2] }));
+            }} placeholder="IP ou hostname" required /></label>
+            <label className="fortigate-field fgt-port-field"><span>Porta HTTPS</span><input type="number" min="1" max="65535" value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} placeholder="443" title="Porta de administração HTTPS do FortiGate (admin-sport). Padrão 443." /></label>
             <label className="fortigate-field"><span>{editingId ? 'Substituir token (opcional)' : 'Token de API'}</span><input className="input" type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={editingId ? 'Deixe vazio para manter o atual' : 'Token API'} required={!editingId} autoComplete="new-password" /></label>
             <div className="fgt-form-actions">
               {(formOpen || editingId) && <button type="button" className="ghost" onClick={resetForm}>Cancelar</button>}
@@ -375,7 +380,7 @@ function FortigatePage() {
                     <span className="fortigate-device-icon" aria-hidden="true">▣</span>
                     <div className="fgt-device-info">
                       <b>{firewall.name}</b>
-                      <span className="mono">{firewall.host}</span>
+                      <span className="mono">{firewall.host}{firewall.port && firewall.port !== 443 ? `:${firewall.port}` : ''}</span>
                     </div>
                     <span className="fortigate-vdom">VDOM {firewall.vdom || 'root'}</span>
                   </div>
