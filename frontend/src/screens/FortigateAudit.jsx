@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
-import { fmtBytes, fetchFortigates, fetchFortigateAudit } from '../api.js';
+import { fmtBytes, fetchFortigates, fetchFortigateAudit, fetchFortigateEvents, collectFortigateEvents } from '../api.js';
 
 // Auditoria de usuários e interfaces do FortiGate (somente leitura):
 // administradores e tokens de API (trusted hosts, 2FA), usuários locais e
@@ -14,7 +14,8 @@ const ERROR_LABEL = {
   admins: 'Administradores', apiUsers: 'Tokens de API', interfaces: 'Interfaces', interfaceStats: 'Estatísticas das interfaces',
   localUsers: 'Usuários locais', userGroups: 'Grupos de usuários', authUsers: 'Usuários autenticados',
   ipsecPhase1: 'VPN IPsec (fase 1)', ipsecPhase2: 'VPN IPsec (fase 2)', ipsecMonitor: 'Status dos túneis IPsec',
-  sslSettings: 'Configuração da SSL-VPN', sslMonitor: 'Sessões SSL-VPN'
+  sslSettings: 'Configuração da SSL-VPN', sslMonitor: 'Sessões SSL-VPN', adminEvents: 'Eventos de administradores',
+  currentAdmins: 'Sessões administrativas', userLogins: 'Logins de usuários (log)'
 };
 // Cor dos grupos DH: fraco (1/2/5) · desaconselhado (22–26) · forte (ECDH) · MODP aceitável.
 const dhClass = (g) => ([1, 2, 5].includes(g) ? 'high' : [22, 23, 24, 25, 26].includes(g) ? 'med' : g >= 19 ? 'low' : '');
@@ -41,6 +42,174 @@ function fmtDuration(sec) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return h ? `${h}h ${m}min` : `${m}min`;
+}
+
+// Eventos de administradores: login/logout, mudanças de configuração, download
+// de backup. Lidos do log em memória do FortiGate (volátil) e persistidos no
+// Postgres pelo backend (coleta periódica + a cada auditoria), sem duplicar.
+// Esta seção consulta o histórico do banco, com filtros.
+const EVENT_ACTION_LABEL = { login: 'Login', logout: 'Logout', download: 'Download', Edit: 'Alteração', Add: 'Criação', Delete: 'Exclusão', outro: 'Outro' };
+const EVENT_ACTION_CLS = { login: 'ok', logout: '', download: 'warn', Edit: 'warn', Add: 'warn', Delete: 'bad' };
+const EVENT_PAGE = 50;
+const EVENT_PERIODS = [
+  { value: '24h', label: 'Últimas 24 h', ms: 24 * 3600e3 },
+  { value: '7d', label: 'Últimos 7 dias', ms: 7 * 86400e3 },
+  { value: '30d', label: 'Últimos 30 dias', ms: 30 * 86400e3 },
+  { value: '90d', label: 'Últimos 90 dias', ms: 90 * 86400e3 },
+  { value: 'all', label: 'Tudo', ms: 0 }
+];
+const fmtWhen = (v) => (v ? new Date(v).toLocaleString('pt-BR') : '—');
+const isFail = (e) => e.status === 'failure' || /failed|falh/i.test(e.description || '');
+
+function AdminEvents({ fortigateId, refreshKey }) {
+  const [user, setUser] = useState('');
+  const [action, setAction] = useState('');
+  const [status, setStatus] = useState('');
+  const [period, setPeriod] = useState('30d');
+  const [q, setQ] = useState('');
+  const [qApplied, setQApplied] = useState('');
+  const [page, setPage] = useState(0);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [collecting, setCollecting] = useState(false);
+  const [note, setNote] = useState('');
+
+  // Busca de texto com atraso para não consultar a cada tecla.
+  useEffect(() => { const t = setTimeout(() => setQApplied(q.trim()), 350); return () => clearTimeout(t); }, [q]);
+  useEffect(() => { setPage(0); }, [user, action, status, period, qApplied, fortigateId]);
+  useEffect(() => { setUser(''); setAction(''); }, [fortigateId]);
+
+  useEffect(() => {
+    if (!fortigateId) return undefined;
+    let alive = true;
+    setLoading(true); setError('');
+    const p = EVENT_PERIODS.find((x) => x.value === period);
+    const from = p?.ms ? new Date(Date.now() - p.ms).toISOString() : '';
+    fetchFortigateEvents({ fortigateId, user, action, status, from, q: qApplied, limit: EVENT_PAGE, offset: page * EVENT_PAGE })
+      .then((r) => { if (alive) setData(r); })
+      .catch((e) => { if (alive) { setData(null); setError(String(e.message || e)); } })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [fortigateId, user, action, status, period, qApplied, page, refreshKey]);
+
+  async function collectNow() {
+    setCollecting(true); setNote('');
+    try {
+      const r = await collectFortigateEvents(fortigateId);
+      const me = (r.results || [])[0];
+      setNote(me?.error ? `Falha: ${me.error}` : `${me?.inserted ?? 0} novo(s) de ${me?.read ?? 0} lidos no FortiGate.`);
+      const p = EVENT_PERIODS.find((x) => x.value === period);
+      const from = p?.ms ? new Date(Date.now() - p.ms).toISOString() : '';
+      setData(await fetchFortigateEvents({ fortigateId, user, action, status, from, q: qApplied, limit: EVENT_PAGE, offset: page * EVENT_PAGE }));
+    } catch (e) { setNote(`Falha: ${e.message || e}`); }
+    finally { setCollecting(false); setTimeout(() => setNote(''), 6000); }
+  }
+
+  const events = data?.events || [];
+  const total = data?.total || 0;
+  const pages = Math.max(1, Math.ceil(total / EVENT_PAGE));
+  const actionLabel = (a) => EVENT_ACTION_LABEL[a] || a || 'Outro';
+  const filtersOn = !!(user || action || status || q || period !== '30d');
+  function clearFilters() { setUser(''); setAction(''); setStatus(''); setQ(''); setQApplied(''); setPeriod('30d'); setPage(0); }
+
+  // Última passagem do coletor: alerta se atrasou mais que o dobro do intervalo.
+  const lastCollected = data?.lastCollectedAt ? new Date(data.lastCollectedAt) : null;
+  const everyMin = data?.collectEveryMin || 0;
+  const lateMs = lastCollected ? Date.now() - lastCollected.getTime() : null;
+  const collectLate = everyMin > 0 && lateMs != null && lateMs > everyMin * 2 * 60000;
+
+  return (
+    <>
+      <div className="fau-subtitle fau-events-head">
+        <h4>Eventos de administradores <span className="hint">({num(total)}{loading ? ' · consultando…' : ''})</span></h4>
+        <div className="fau-events-filters">
+          <label className="dashboard-period-select"><span>Período</span>
+            <select value={period} onChange={(e) => setPeriod(e.target.value)}>
+              {EVENT_PERIODS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+            </select>
+          </label>
+          <label className="dashboard-period-select"><span>Usuário</span>
+            <select value={user} onChange={(e) => setUser(e.target.value)}>
+              <option value="">Todos</option>
+              {(data?.users || []).map((u) => <option key={u.user} value={u.user}>{u.user} ({u.count})</option>)}
+            </select>
+          </label>
+          <label className="dashboard-period-select"><span>Ação</span>
+            <select value={action} onChange={(e) => setAction(e.target.value)}>
+              <option value="">Todas</option>
+              {(data?.actions || []).map((a) => <option key={a.action} value={a.action}>{actionLabel(a.action)} ({a.count})</option>)}
+            </select>
+          </label>
+          <label className="dashboard-period-select"><span>Resultado</span>
+            <select value={status} onChange={(e) => setStatus(e.target.value)}>
+              <option value="">Todos</option>
+              <option value="success">Sucesso</option>
+              <option value="failure">Falha</option>
+            </select>
+          </label>
+          <label className="dashboard-period-select fgt-psearch"><span>Buscar</span>
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="IP, objeto, mensagem…" />
+          </label>
+          <button className="ghost" onClick={clearFilters} disabled={!filtersOn} title="Volta aos filtros padrão (últimos 30 dias)">Limpar filtros</button>
+          <button className="ghost" onClick={collectNow} disabled={collecting || !fortigateId} title="Lê o log do FortiGate agora e guarda o que ainda não existe no banco">{collecting ? 'Coletando…' : '↓ Coletar agora'}</button>
+        </div>
+      </div>
+      <p className="hint fau-events-status">
+        <span className={collectLate ? 'late' : ''} title={collectLate ? `A última passagem do coletor foi há mais de ${everyMin * 2} min: verifique se o backend está no ar.` : 'O coletor roda no backend, independentemente de alguém estar com a tela aberta.'}>
+          Última coleta: <b>{lastCollected ? lastCollected.toLocaleString('pt-BR') : 'nunca'}</b>
+          {everyMin > 0 ? ` · automática a cada ${everyMin} min` : ' · coleta automática desligada'}
+          {collectLate && <b className="fau-late-tag">ATRASADA</b>}
+        </span>
+        {data?.lastEventAt && <span> · evento mais recente guardado: <b>{new Date(data.lastEventAt).toLocaleString('pt-BR')}</b></span>}
+        {note && <b className="fau-events-note"> {note}</b>}
+      </p>
+      <p className="hint">Histórico guardado no banco a partir do log em memória do FortiGate (subtype <code>system</code>, só registros com <code>user</code>). O equipamento descarta os antigos; aqui ficam todos, sem duplicar.</p>
+      {error && <p className="error">{error}</p>}
+      <div className="table-wrap">
+        <table className="fgb-table fau-table fau-events">
+          <colgroup><col style={{ width: '13%' }} /><col style={{ width: '13%' }} /><col style={{ width: '9%' }} /><col style={{ width: '15%' }} /><col style={{ width: '38%' }} /><col style={{ width: '12%' }} /></colgroup>
+          <thead><tr><th>Quando</th><th>Usuário</th><th>Ação</th><th>Origem</th><th>Detalhe</th><th>Objeto</th></tr></thead>
+          <tbody>
+            {events.map((e) => (
+              <tr key={e.id} className={isFail(e) ? 'fau-event-fail' : ''}>
+                <td className="mono">{fmtWhen(e.when)}</td>
+                <td><b>{e.user}</b>{e.profile && <small>{e.profile}</small>}</td>
+                <td><span className={`fau-tag ${isFail(e) ? 'bad' : EVENT_ACTION_CLS[e.action] || ''}`}>{actionLabel(e.action)}{isFail(e) ? ' (falha)' : ''}</span></td>
+                <td className="mono">{e.srcip || e.ui || '—'}{e.method && e.srcip && <small>{e.method}</small>}</td>
+                <td><span title={e.message || ''}>{e.description || '—'}</span>{e.message && e.message !== e.description && <small>{e.message}</small>}</td>
+                <td className="mono">{e.config ? <span title={e.configAttr || ''}>{e.config}</span> : <span className="fgt-muted">—</span>}{e.configAttr && <small>{e.configAttr}</small>}</td>
+              </tr>
+            ))}
+            {!events.length && !loading && <tr><td colSpan={6} className="empty">{error ? 'Histórico não lido.' : filtersOn ? <>Nenhum evento para este filtro. <button className="fga-link" onClick={clearFilters}>Limpar filtros</button></> : 'Nenhum evento guardado ainda. Clique em "Coletar agora".'}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {pages > 1 && (
+        <div className="fau-events-more">
+          <button className="ghost" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>‹ Anterior</button>
+          <span className="hint">página {page + 1} de {pages}</span>
+          <button className="ghost" onClick={() => setPage((p) => Math.min(pages - 1, p + 1))} disabled={page >= pages - 1}>Próxima ›</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+
+// Último login (admins: log system + sessão ativa; locais: log vpn/user +
+// sessão autenticada). Sem FortiAnalyzer a fonte é o log em memória, que gira:
+// "—" significa "nada no log atual", não "nunca".
+function LastLogin({ value }) {
+  if (!value?.when) return <span className="fgt-muted" title="Sem registro no log em memória do FortiGate (o log é volátil)">—</span>;
+  const when = new Date(value.when);
+  const title = [`${when.toLocaleString('pt-BR')}`, value.from && `de ${value.from}`, value.method && `via ${value.method}`, value.source === 'sessao' ? 'sessão ativa agora' : 'do log em memória'].filter(Boolean).join(' · ');
+  return (
+    <span className="fau-lastlogin" title={title}>
+      <b>{value.active && <i className="fau-online" title="Logado agora" />}{when.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })} {when.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</b>
+      {value.from && <small className="mono">{value.from}</small>}
+    </span>
+  );
 }
 
 function SevPill({ severity }) {
@@ -249,8 +418,8 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
             {tab === 'admins' && !audit.adminsHidden && (
               <div className="table-wrap">
                 <table className="fgb-table fau-table">
-                  <colgroup><col style={{ width: '8%' }} /><col style={{ width: '16%' }} /><col style={{ width: '10%' }} /><col style={{ width: '12%' }} /><col style={{ width: '24%' }} /><col style={{ width: '10%' }} /><col style={{ width: '8%' }} /><col style={{ width: '12%' }} /></colgroup>
-                  <thead><tr><th>Risco</th><th>Usuário</th><th>Tipo</th><th>Perfil</th><th>Trusted hosts</th><th>2FA</th><th>VDOMs</th><th>Achados</th></tr></thead>
+                  <colgroup><col style={{ width: '7%' }} /><col style={{ width: '14%' }} /><col style={{ width: '9%' }} /><col style={{ width: '11%' }} /><col style={{ width: '20%' }} /><col style={{ width: '9%' }} /><col style={{ width: '7%' }} /><col style={{ width: '12%' }} /><col style={{ width: '11%' }} /></colgroup>
+                  <thead><tr><th>Risco</th><th>Usuário</th><th>Tipo</th><th>Perfil</th><th>Trusted hosts</th><th>2FA</th><th>VDOMs</th><th>Último login</th><th>Achados</th></tr></thead>
                   <tbody>
                     {admins.map((u) => {
                       const key = `a-${u.kind}-${u.name}`;
@@ -265,24 +434,27 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
                             <td>{u.anywhere ? <span className="fau-tag bad">Qualquer lugar</span> : <Chips items={u.trustedHosts} className="mono" />}</td>
                             <td>{u.kind === 'api' ? <span className="fgt-muted">n/a</span> : u.twoFactor ? <span className="fau-tag ok">{u.twoFactor}</span> : <span className="fau-tag warn">Desabilitado</span>}</td>
                             <td><Chips items={u.vdoms} max={2} /></td>
+                            <td><LastLogin value={u.lastLogin} /></td>
                             <td><FindingsCell findings={u.findings} open={open} /></td>
                           </tr>
-                          {open && <FindingsRow findings={u.findings} colSpan={8} />}
+                          {open && <FindingsRow findings={u.findings} colSpan={9} />}
                         </Fragment>
                       );
                     })}
-                    {!admins.length && <tr><td colSpan={8} className="empty">{audit.errors?.admins ? 'Tabela não lida (veja o aviso acima).' : 'Nenhum administrador para este filtro.'}</td></tr>}
+                    {!admins.length && <tr><td colSpan={9} className="empty">{audit.errors?.admins ? 'Tabela não lida (veja o aviso acima).' : 'Nenhum administrador para este filtro.'}</td></tr>}
                   </tbody>
                 </table>
               </div>
             )}
 
+            {tab === 'admins' && <AdminEvents fortigateId={fwId} refreshKey={audit.generatedAt} />}
+
             {tab === 'local' && (
               <>
                 <div className="table-wrap">
                   <table className="fgb-table fau-table">
-                    <colgroup><col style={{ width: '8%' }} /><col style={{ width: '20%' }} /><col style={{ width: '10%' }} /><col style={{ width: '16%' }} /><col style={{ width: '12%' }} /><col style={{ width: '22%' }} /><col style={{ width: '12%' }} /></colgroup>
-                    <thead><tr><th>Risco</th><th>Usuário</th><th>Status</th><th>Autenticação</th><th>2FA</th><th>Grupos</th><th>Achados</th></tr></thead>
+                    <colgroup><col style={{ width: '7%' }} /><col style={{ width: '18%' }} /><col style={{ width: '9%' }} /><col style={{ width: '14%' }} /><col style={{ width: '10%' }} /><col style={{ width: '19%' }} /><col style={{ width: '12%' }} /><col style={{ width: '11%' }} /></colgroup>
+                    <thead><tr><th>Risco</th><th>Usuário</th><th>Status</th><th>Autenticação</th><th>2FA</th><th>Grupos</th><th>Último login</th><th>Achados</th></tr></thead>
                     <tbody>
                       {localUsers.map((u) => {
                         const key = `l-${u.name}`;
@@ -296,13 +468,14 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
                               <td>{AUTH_LABEL[u.type] || u.type}{u.server && <small>{u.server}</small>}</td>
                               <td>{u.type !== 'password' ? <span className="fgt-muted">no servidor</span> : u.twoFactor ? <span className="fau-tag ok">{u.twoFactor}</span> : <span className="fau-tag warn">Desabilitado</span>}</td>
                               <td><Chips items={u.groups} max={3} /></td>
+                              <td><LastLogin value={u.lastLogin} /></td>
                               <td><FindingsCell findings={u.enabled ? u.findings : []} open={open} /></td>
                             </tr>
-                            {open && <FindingsRow findings={u.enabled ? u.findings : []} colSpan={7} />}
+                            {open && <FindingsRow findings={u.enabled ? u.findings : []} colSpan={8} />}
                           </Fragment>
                         );
                       })}
-                      {!localUsers.length && <tr><td colSpan={7} className="empty">{audit.errors?.localUsers ? 'Tabela não lida (veja o aviso acima).' : 'Nenhum usuário local para este filtro.'}</td></tr>}
+                      {!localUsers.length && <tr><td colSpan={8} className="empty">{audit.errors?.localUsers ? 'Tabela não lida (veja o aviso acima).' : 'Nenhum usuário local para este filtro.'}</td></tr>}
                     </tbody>
                   </table>
                 </div>

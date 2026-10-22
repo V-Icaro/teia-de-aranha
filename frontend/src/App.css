@@ -1479,6 +1479,22 @@ button.inv-ctx-app-head:hover:not(:disabled) { border: 0; background: #f4f7f9; b
 .fau-finding p { margin: 3px 0 0; color: #4d575b; font-size: 11.5px; line-height: 1.45; white-space: normal; }
 .fau-finding .fau-rec span { color: #168e5a; font-weight: 700; }
 .fau-subtitle { display: flex; align-items: baseline; gap: 6px; margin: 4px 14px 0; color: #4e595d; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; }
+.fau-events-head { align-items: center; justify-content: space-between; flex-wrap: wrap; margin-top: 18px; padding-top: 14px; border-top: 1px solid #e3e8e9; }
+.fau-events-head h4 { margin: 0; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; }
+.fau-events-filters { display: flex; gap: 10px; text-transform: none; letter-spacing: 0; }
+.fau-events td small { display: block; margin-top: 2px; color: #89938e; font-size: 10px; white-space: normal; }
+.fau-events tr.fau-event-fail td { background: #fff7f7; }
+.fau-events-more { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 14px 4px; }
+.fau-events-filters { align-items: flex-end; flex-wrap: wrap; }
+.fau-events-note { font-weight: 600; color: #1c8a58; }
+.fau-events-status { margin-top: 6px; }
+.fau-events-status b { color: #2f3a3e; }
+.fau-events-status .late b { color: #b3261e; }
+.fau-late-tag { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: #fdecec; color: #b3261e !important; font-size: 10px; letter-spacing: .3px; }
+.fau-lastlogin { display: inline-flex; flex-direction: column; gap: 1px; line-height: 1.2; }
+.fau-lastlogin b { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; color: #2f3a3e; white-space: nowrap; }
+.fau-lastlogin small { color: #89938e; font-size: 10px; }
+.fau-online { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #1c8a58; box-shadow: 0 0 0 2px #e5f5ec; }
 .fgb-panel > .fau-groups { margin-top: 8px; }
 .fau-dot { width: 7px; height: 7px; border-radius: 50%; background: #c94d52; }
 .fau-legend .fau-svc { margin: 0 2px; }

@@ -27,6 +27,7 @@ const { auditFortigate } = require('./fortigate-audit.js');
 const cron = require('node-cron');
 const { downloadBackup, saveBackupFile, readBackupFile, deleteBackupFile } = require('./fortigate-backup');
 const { runFortigateBackup, runFortigateBackupPolicy, startFortigateBackupScheduler } = require('./fortigate-backup');
+const fgEvents = require('./fortigate-events');
 
 dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
 
@@ -55,6 +56,9 @@ if ((process.env.REGIONS_CRON || '15 6 * * *') !== '0') {
 if (process.env.BACKUP_SCHEDULER !== '0') {
   dbInit().then((ok) => { if (ok) startFortigateBackupScheduler(); else console.warn('[fgt-backup] agendador não iniciado: Postgres indisponível'); });
 }
+// Histórico de eventos de administradores (o log do FortiGate é volátil).
+// EVENTS_COLLECT_MIN=0 desliga a coleta periódica.
+dbInit().then((ok) => { if (ok) fgEvents.startEventCollector(); });
 
 const app = express();
 app.use(cors());
@@ -325,10 +329,46 @@ app.get('/api/fortigate/:id/audit', async (req, res) => {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
     const id = intParam(req.params.id, { nome: 'id', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER });
     const { firewall, credentials } = await fortigateCredentials(id);
-    res.json({ firewall: { id: firewall.id, name: firewall.name, host: firewall.host }, ...(await auditFortigate(credentials)) });
+    const audit = await auditFortigate(credentials);
+    // Aproveita a auditoria para persistir os eventos (não bloqueia a resposta em caso de erro).
+    fgEvents.collectFortigateEvents({ id: firewall.id, ...credentials }).catch((e) => console.error(`[fgt-events] ${firewall.name}: ${e.message}`));
+    res.json({ firewall: { id: firewall.id, name: firewall.name, host: firewall.host }, ...audit });
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha na auditoria do FortiGate', detail: String(e.message || e) });
+  }
+});
+
+// Histórico persistido de eventos de administradores. Filtros: fortigateId,
+// user, action ('outro' = sem ação), status (success|failure), from, to (ISO),
+// q (texto livre), limit, offset.
+app.get('/api/fortigate-events', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const { fortigateId, user, action, status, from, to, q } = req.query;
+    const limit = intParam(req.query.limit, { nome: 'limit', def: 100, min: 1, max: 1000 });
+    const offset = intParam(req.query.offset, { nome: 'offset', def: 0, min: 0, max: Number.MAX_SAFE_INTEGER });
+    res.json(await fgEvents.queryEvents({ fortigateId, user, action, status, from, to, q, limit, offset }));
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao consultar eventos', detail: String(e.message || e) });
+  }
+});
+
+// Força uma coleta agora (todos os firewalls ou só um).
+app.post('/api/fortigate-events/collect', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const id = req.body?.fortigateId ? intParam(req.body.fortigateId, { nome: 'fortigateId', def: 0, min: 1, max: Number.MAX_SAFE_INTEGER }) : null;
+    if (id) {
+      const { firewall, credentials } = await fortigateCredentials(id);
+      res.json({ results: [{ fortigateId: id, ...(await fgEvents.collectFortigateEvents({ id: firewall.id, ...credentials })) }] });
+    } else {
+      res.json({ results: await fgEvents.collectAll() });
+    }
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao coletar eventos', detail: String(e.message || e) });
   }
 });
 

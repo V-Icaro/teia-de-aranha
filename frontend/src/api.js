@@ -352,6 +352,19 @@ async function fortigateReq(path = '', opts = {}) {
   return r.json();
 }
 export const fetchFortigates = () => fortigateReq('');
+// Histórico persistido de eventos de administradores do FortiGate.
+export async function fetchFortigateEvents(params = {}) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') p.set(k, String(v));
+  const r = await fetch(`/api/fortigate-events?${p.toString()}`);
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
+  return r.json();
+}
+export async function collectFortigateEvents(fortigateId) {
+  const r = await fetch('/api/fortigate-events/collect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fortigateId }) });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `HTTP ${r.status}`); }
+  return r.json();
+}
 // Relógio do backend (é a hora usada pelo agendador de backups).
 export async function fetchServerTime() {
   const r = await fetch('/api/server-time');

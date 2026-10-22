@@ -654,8 +654,107 @@ async function readTable(host, token, path, port) {
 
 const bySev = (a, b) => (SEV_ORDER[b.severity] || 0) - (SEV_ORDER[a.severity] || 0) || String(a.name).localeCompare(String(b.name));
 
+// Eventos do log em memória (subtype system) que têm um usuário por trás:
+// login/logout, alterações de configuração, download de backup etc. Eventos
+// de VPN/sistema sem usuário real ("N/A") ficam de fora.
+const ADMIN_EVENT_ROWS = Math.max(50, Math.min(2000, Number.parseInt(process.env.FORTIGATE_EVENT_ROWS || '500', 10) || 500));
+
+function normalizeAdminEvent(r) {
+  const ts = Number(r?._metadata?.timestamp);
+  const when = Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString()
+    : (r.date && r.time ? `${r.date}T${r.time}${r.tz ? r.tz.replace(/(\d{2})(\d{2})$/, '$1:$2') : ''}` : null);
+  const cfg = [r.cfgpath, r.cfgobj].filter(Boolean).join(' ');
+  return {
+    when,
+    user: String(r.user),
+    action: r.action || null,
+    description: r.logdesc || null,
+    message: r.msg || null,
+    level: r.level || null,
+    status: r.status || null,
+    ui: r.ui || null,
+    srcip: r.srcip || null,
+    method: r.method || null,
+    profile: r.profile || null,
+    config: cfg || null,
+    configAttr: r.cfgattr || null,
+    logid: r.logid || null
+  };
+}
+
+async function readAdminEvents(host, token, port) {
+  const path = `/api/v2/log/memory/event/system?rows=${ADMIN_EVENT_ROWS}&filter=${encodeURIComponent('subtype==system')}`;
+  const t = await readTable(host, token, path, port);
+  if (t.error) return { events: [], error: t.error };
+  const events = t.rows
+    .filter((r) => r && r.user && String(r.user).trim() && String(r.user).toUpperCase() !== 'N/A')
+    .map(normalizeAdminEvent)
+    .sort((a, b) => String(b.when || '').localeCompare(String(a.when || '')));
+  return { events, error: null };
+}
+
+// ---- último login -----------------------------------------------------
+// O FortiOS não guarda "último login" na configuração. A melhor fonte sem
+// FortiAnalyzer é o log em memória (volátil) + quem está logado agora.
+const isRealUser = (u) => u && String(u).trim() && String(u).toUpperCase() !== 'N/A';
+const eventWhen = (r) => {
+  const ts = Number(r?._metadata?.timestamp);
+  return Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString() : null;
+};
+
+// Admins: eventos "Admin login successful" do log system + sessões ativas
+// (monitor/system/current-admins), que cobrem o caso do log já ter girado.
+function adminLastLogins(adminEvents, currentAdmins) {
+  const map = new Map();
+  const consider = (name, entry) => {
+    if (!isRealUser(name) || !entry.when) return;
+    const cur = map.get(name);
+    if (!cur || entry.when > cur.when) map.set(name, entry);
+  };
+  for (const e of adminEvents) {
+    if (e.action === 'login' && e.status === 'success') consider(e.user, { when: e.when, from: e.srcip || e.ui || null, method: e.method || null, source: 'log' });
+  }
+  for (const s of currentAdmins || []) {
+    const t = Number(s.time);
+    consider(s.admin, { when: Number.isFinite(t) && t > 0 ? new Date(t * 1000).toISOString() : null, from: s.srcaddr || null, method: s.method || null, source: 'sessao', active: true });
+  }
+  return map;
+}
+
+// Usuários locais: autenticações no log (SSL-VPN/IPsec/portal cativo) +
+// quem está autenticado agora no firewall (monitor/user/firewall).
+async function readUserLogins(host, token, port, firewallSessions) {
+  const map = new Map();
+  const consider = (name, entry) => {
+    if (!isRealUser(name) || !entry.when) return;
+    const cur = map.get(name);
+    if (!cur || entry.when > cur.when) map.set(name, entry);
+  };
+  const errors = [];
+  for (const sub of ['vpn', 'user']) {
+    const path = `/api/v2/log/memory/event/system?rows=${ADMIN_EVENT_ROWS}&filter=${encodeURIComponent(`subtype==${sub}`)}`;
+    const t = await readTable(host, token, path, port);
+    if (t.error) { errors.push(`${sub}: ${t.error}`); continue; }
+    for (const r of t.rows) {
+      if (!isRealUser(r.user)) continue;
+      // Só eventos de autenticação bem-sucedida de usuário (não negociação IKE por IP).
+      const a = String(r.action || '').toLowerCase();
+      const d = String(r.logdesc || '').toLowerCase();
+      const ok = (a === 'tunnel-up' || a === 'ssl-login' || a === 'auth-logon' || a === 'authentication' || /logged in|login succeeded|auth(entication)? success/.test(d)) && r.status !== 'failure';
+      if (!ok) continue;
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(String(r.user))) continue; // IP de peer IPsec, não usuário
+      consider(r.user, { when: eventWhen(r), from: r.remip || r.srcip || null, method: r.tunneltype || sub, source: 'log' });
+    }
+  }
+  for (const s of firewallSessions || []) {
+    const when = s.durationSec != null ? new Date(Date.now() - s.durationSec * 1000).toISOString() : null;
+    consider(s.username, { when, from: s.ip || null, method: s.method || s.type || null, source: 'sessao', active: true });
+  }
+  return { map, error: errors.length ? errors.join(' · ') : null };
+}
+
 async function auditFortigate({ host, token, port }) {
-  const [admins, apiUsers, interfaces, ifaceStats, localUsers, userGroups, authUsers, p1, p2, ipsecMon, sslSettings, sslMon, accprofiles] = await Promise.all([
+  const [admins, apiUsers, interfaces, ifaceStats, localUsers, userGroups, authUsers, p1, p2, ipsecMon, sslSettings, sslMon, accprofiles, adminEvents, currentAdmins] = await Promise.all([
     readTable(host, token, '/api/v2/cmdb/system/admin', port),
     readTable(host, token, '/api/v2/cmdb/system/api-user', port),
     readTable(host, token, '/api/v2/cmdb/system/interface', port),
@@ -669,7 +768,9 @@ async function auditFortigate({ host, token, port }) {
     readTable(host, token, '/api/v2/cmdb/vpn.ssl/settings', port),
     readTable(host, token, '/api/v2/monitor/vpn/ssl', port),
     // Perfis: para saber se um perfil personalizado tem privilégio total (o nome não importa).
-    readTable(host, token, '/api/v2/cmdb/system/accprofile', port)
+    readTable(host, token, '/api/v2/cmdb/system/accprofile', port),
+    readAdminEvents(host, token, port),
+    readTable(host, token, '/api/v2/monitor/system/current-admins', port)
   ]);
   const profiles = new Map(accprofiles.rows.map((p) => [p.name, p]));
   // Sem nenhuma tabela legível não há o que mostrar: devolve o erro de verdade.
@@ -696,6 +797,14 @@ async function auditFortigate({ host, token, port }) {
   local.users.sort(bySev);
   local.groups.sort(bySev);
   const sessions = normalizeSessions(authUsers.raw);
+
+  // Último login: admins pelo log system + sessões administrativas ativas;
+  // usuários locais pelo log vpn/user + sessões autenticadas no firewall.
+  const adminLogins = adminLastLogins(adminEvents.events, currentAdmins.rows);
+  for (const u of adminList) u.lastLogin = adminLogins.get(u.name) || null;
+  const userLogins = await readUserLogins(host, token, port, sessions);
+  for (const u of local.users) u.lastLogin = userLogins.map.get(u.name) || null;
+
   const ipsec = auditIpsec(p1.rows, p2.rows, ipsecMon.rows);
   ipsec.tunnels.sort(bySev);
   const sslvpn = sslSettings.error ? null : auditSslVpn(sslSettings.raw, sslMon.rows);
@@ -729,7 +838,10 @@ async function auditFortigate({ host, token, port }) {
       ipsecPhase2: p2.error,
       ipsecMonitor: ipsecMon.error,
       sslSettings: sslSettings.error,
-      sslMonitor: sslMon.error
+      sslMonitor: sslMon.error,
+      adminEvents: adminEvents.error,
+      currentAdmins: currentAdmins.error,
+      userLogins: userLogins.error
     },
     adminsHidden,
     summary: {
@@ -753,10 +865,12 @@ async function auditFortigate({ host, token, port }) {
       vpnFindings: vpnFindings.length,
       sslVpnActive: !!sslvpn?.active,
       sslVpnSessions: sslvpn?.sessions.length || 0,
+      adminEvents: adminEvents.events.length,
       bySeverity
     },
     vpn: { ipsec: ipsec.tunnels, orphanPhase2: ipsec.orphans, sslvpn },
     admins: adminList,
+    adminEvents: adminEvents.events,
     localUsers: local.users,
     groups: local.groups,
     sessions,
