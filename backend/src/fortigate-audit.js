@@ -113,17 +113,27 @@ function trustFindings(th, kind) {
 
 const names = (v) => (Array.isArray(v) ? v.map((x) => (x && typeof x === 'object' ? x.name : x)).filter(Boolean) : (v ? [v] : []));
 
-function auditAdmins(rows) {
+// "Privilégio total" pelo CONTEÚDO do perfil, não pelo nome: o super_admin
+// de fábrica ou qualquer perfil personalizado com Sistema em leitura/escrita
+// e escopo global. Perfis que o token não consegue ler ficam como não-totais.
+function hasFullPrivilege(profileName, profiles) {
+  if (!profileName) return false;
+  if (profileName === 'super_admin') return true;
+  const p = profiles?.get(profileName);
+  return !!p && p.sysgrp === 'read-write' && (p.scope || 'vdom') === 'global';
+}
+
+function auditAdmins(rows, profiles) {
   return rows.map((a) => {
     const th = trustedHostsOfAdmin(a);
     const profile = a.accprofile || null;
-    const superAdmin = profile === 'super_admin';
+    const superAdmin = hasFullPrivilege(profile, profiles);
     const twoFactor = a['two-factor'] && a['two-factor'] !== 'disable' ? a['two-factor'] : null;
     const remote = a['remote-auth'] === 'enable';
     const findings = trustFindings(th, 'administrador');
     if (!twoFactor && !remote) {
       findings.push(finding(superAdmin ? 'alta' : 'media', 'Sem segundo fator (2FA)',
-        `Conta local sem 2FA${superAdmin ? ' e com perfil super_admin' : ''}: só a senha protege o acesso.`,
+        `Conta local sem 2FA${superAdmin ? ` e com privilégio total (perfil ${profile})` : ''}: só a senha protege o acesso.`,
         'Habilite FortiToken, e-mail ou SMS (two-factor) ou use autenticação remota com MFA.'));
     }
     if (a.wildcard === 'enable') {
@@ -153,14 +163,15 @@ function auditAdmins(rows) {
   });
 }
 
-function auditApiUsers(rows) {
+function auditApiUsers(rows, profiles) {
   return rows.map((u) => {
     const th = trustedHostsOfApiUser(u);
     const profile = u.accprofile || null;
+    const full = hasFullPrivilege(profile, profiles);
     const findings = trustFindings(th, 'token de API');
-    if (profile === 'super_admin') {
-      findings.push(finding('media', 'Token de API com super_admin',
-        'O token tem permissão total de escrita no equipamento.',
+    if (full) {
+      findings.push(finding('media', 'Token de API com privilégio total',
+        `O token (perfil ${profile}) tem permissão de escrita em todo o equipamento.`,
         'Crie um perfil só com as permissões necessárias (ex.: leitura).'));
     }
     if (u['cors-allow-origin'] === '*') {
@@ -172,7 +183,7 @@ function auditApiUsers(rows) {
       kind: 'api',
       name: u.name,
       profile,
-      superAdmin: profile === 'super_admin',
+      superAdmin: full,
       vdoms: names(u.vdom),
       trustedHosts: [...th.v4, ...th.v6],
       anywhere: !th.v4.length && !th.v6.length,
@@ -644,7 +655,7 @@ async function readTable(host, token, path, port) {
 const bySev = (a, b) => (SEV_ORDER[b.severity] || 0) - (SEV_ORDER[a.severity] || 0) || String(a.name).localeCompare(String(b.name));
 
 async function auditFortigate({ host, token, port }) {
-  const [admins, apiUsers, interfaces, ifaceStats, localUsers, userGroups, authUsers, p1, p2, ipsecMon, sslSettings, sslMon] = await Promise.all([
+  const [admins, apiUsers, interfaces, ifaceStats, localUsers, userGroups, authUsers, p1, p2, ipsecMon, sslSettings, sslMon, accprofiles] = await Promise.all([
     readTable(host, token, '/api/v2/cmdb/system/admin', port),
     readTable(host, token, '/api/v2/cmdb/system/api-user', port),
     readTable(host, token, '/api/v2/cmdb/system/interface', port),
@@ -656,28 +667,30 @@ async function auditFortigate({ host, token, port }) {
     readTable(host, token, '/api/v2/cmdb/vpn.ipsec/phase2-interface', port),
     readTable(host, token, '/api/v2/monitor/vpn/ipsec', port),
     readTable(host, token, '/api/v2/cmdb/vpn.ssl/settings', port),
-    readTable(host, token, '/api/v2/monitor/vpn/ssl', port)
+    readTable(host, token, '/api/v2/monitor/vpn/ssl', port),
+    // Perfis: para saber se um perfil personalizado tem privilégio total (o nome não importa).
+    readTable(host, token, '/api/v2/cmdb/system/accprofile', port)
   ]);
+  const profiles = new Map(accprofiles.rows.map((p) => [p.name, p]));
   // Sem nenhuma tabela legível não há o que mostrar: devolve o erro de verdade.
   if ([admins, apiUsers, interfaces, localUsers, userGroups].every((t) => t.error)) {
     throw Object.assign(new Error(`Não foi possível ler a configuração: ${admins.error}`), { status: 502 });
   }
   // Todo FortiGate tem ao menos um administrador, e o próprio token é um
-  // usuário de API: lista vazia SEM erro significa que o FortiOS ocultou os
-  // objetos. Ele esconde contas (e perfis) com privilégio maior que o do
-  // token — um token super_admin_readonly não enxerga contas super_admin
-  // (pedir uma delas pelo nome devolve 404). O backup feito com esse token
-  // sai com as mesmas seções vazias.
+  // usuário de API: lista vazia SEM erro significa que o FortiOS não liberou
+  // os objetos para o perfil deste token (ele oculta contas com privilégio
+  // maior; pedir uma pelo nome devolve 404). Seja qual for o nome do perfil,
+  // a tela só informa que não há acesso.
   let adminsHidden = false;
   if (!admins.error && admins.rows.length === 0) {
     adminsHidden = true;
-    admins.error = 'o FortiGate ocultou os administradores: o perfil do token (por exemplo super_admin_readonly) não enxerga contas com privilégio maior. Para auditar, use um token com perfil super_admin restrito por trusted host ao IP deste servidor.';
+    admins.error = 'sem acesso: o perfil do token não permite listar os administradores.';
   }
   if (!apiUsers.error && apiUsers.rows.length === 0) {
-    apiUsers.error = 'lista vazia: o FortiGate oculta os usuários de API para este perfil de token (o próprio token deveria aparecer).';
+    apiUsers.error = 'sem acesso: o perfil do token não permite listar os usuários de API.';
   }
 
-  const adminList = [...auditAdmins(admins.rows), ...auditApiUsers(apiUsers.rows)].sort(bySev);
+  const adminList = [...auditAdmins(admins.rows, profiles), ...auditApiUsers(apiUsers.rows, profiles)].sort(bySev);
   const ifaces = auditInterfaces(interfaces.rows, statsMap(ifaceStats.raw)).sort(bySev);
   const local = auditLocalUsers(localUsers.rows, userGroups.rows);
   local.users.sort(bySev);

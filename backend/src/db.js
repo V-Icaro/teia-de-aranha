@@ -581,6 +581,7 @@ async function ensureFortigateBackupSchema() {
     finished_at timestamptz,
     created_at timestamptz not null default now()
   )`);
+  await pool.query('alter table fortigate_backup_policies add column if not exists last_run_at timestamptz');
   await pool.query('create index if not exists idx_fg_backups_fg on fortigate_backups(fortigate_id, created_at desc)');
   await pool.query('create index if not exists idx_fg_backups_policy on fortigate_backups(policy_id, created_at desc)');
 }
@@ -603,10 +604,15 @@ async function listFortigateBackupPolicies() {
     daysOfWeek: r.days_of_week || [],
     retentionDays: Number(r.retention_days),
     description: r.description,
+    lastRunAt: r.last_run_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     targets: r.targets || []
   }));
+}
+
+async function markFortigateBackupPolicyRun(id) {
+  await pool.query('update fortigate_backup_policies set last_run_at = now() where id = $1', [Number(id)]);
 }
 
 async function createFortigateBackupPolicy(data) {
@@ -789,7 +795,7 @@ module.exports = {
   addExpectedApplicationClient, deleteExpectedApplicationClient,
   listFortigates, getFortigate, createFortigate, updateFortigate, deleteFortigate,
   ensureFortigateBackupSchema,
-  listFortigateBackupPolicies, createFortigateBackupPolicy, updateFortigateBackupPolicy, deleteFortigateBackupPolicy, getFortigateBackupPolicyTargets,
+  listFortigateBackupPolicies, createFortigateBackupPolicy, updateFortigateBackupPolicy, deleteFortigateBackupPolicy, getFortigateBackupPolicyTargets, markFortigateBackupPolicyRun,
   listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups, fixStuckFortigateBackups,
   _splitHostPort: splitHostPort
 };

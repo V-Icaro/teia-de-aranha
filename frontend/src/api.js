@@ -352,6 +352,12 @@ async function fortigateReq(path = '', opts = {}) {
   return r.json();
 }
 export const fetchFortigates = () => fortigateReq('');
+// Relógio do backend (é a hora usada pelo agendador de backups).
+export async function fetchServerTime() {
+  const r = await fetch('/api/server-time');
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
 export const createFortigate = (body) => fortigateReq('', { method: 'POST', body: JSON.stringify(body) });
 export const updateFortigate = (id, body) => fortigateReq(`/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteFortigate = (id) => fortigateReq(`/${id}`, { method: 'DELETE' });

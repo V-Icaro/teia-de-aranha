@@ -21,12 +21,12 @@ const {
   listFortigateBackups, getFortigateBackup, createFortigateBackupRecord, updateFortigateBackupRecord, deleteFortigateBackupRecord, cleanupFortigateBackups
 } = require('./db');
 const { intParam } = require('./params.js');
-const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable } = require('./fortigate.js');
+const { topPolicies, fetchPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, fetchInterfaceAliases } = require('./fortigate.js');
 const { analyzePolicies } = require('./firewallAnalysis.js');
 const { auditFortigate } = require('./fortigate-audit.js');
 const cron = require('node-cron');
 const { downloadBackup, saveBackupFile, readBackupFile, deleteBackupFile } = require('./fortigate-backup');
-const { runFortigateBackup } = require('./fortigate-backup');
+const { runFortigateBackup, runFortigateBackupPolicy, startFortigateBackupScheduler } = require('./fortigate-backup');
 
 dbInit(); // cria tabelas se preciso (avisa e segue sem Postgres se falhar)
 
@@ -50,9 +50,29 @@ if ((process.env.REGIONS_CRON || '15 6 * * *') !== '0') {
   console.log(`[regions] agendado: ${process.env.REGIONS_CRON || '15 6 * * *'}`);
 }
 
+// Backups agendados do FortiGate: verifica a cada minuto as políticas vencidas.
+// BACKUP_SCHEDULER=0 desliga (ex.: réplica que não deve executar).
+if (process.env.BACKUP_SCHEDULER !== '0') {
+  dbInit().then((ok) => { if (ok) startFortigateBackupScheduler(); else console.warn('[fgt-backup] agendador não iniciado: Postgres indisponível'); });
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Relógio do servidor: os agendamentos de backup são avaliados com esta hora
+// (convertida para o fuso de cada política), não com a hora do navegador.
+app.get('/api/server-time', (_req, res) => {
+  const now = new Date();
+  const timeZone = process.env.CRON_TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  res.json({
+    now: now.toISOString(),
+    epochMs: now.getTime(),
+    timeZone,
+    local: now.toLocaleString('pt-BR', { timeZone }),
+    offsetMinutes: -now.getTimezoneOffset()
+  });
+});
 
 const PORT = process.env.PORT || 3001;
 // Protege o ES e o heap do Node contra janelas/cardinalidades extremas. MAX_EDGES=0
@@ -319,11 +339,12 @@ app.get('/api/fortigate/:id/analysis', async (req, res) => {
     const staleDays = intParam(req.query.staleDays, { nome: 'staleDays', def: 90, min: 1, max: 3650 });
     const { credentials } = await fortigateCredentials(id);
     const vdom = String(req.query.vdom || credentials.vdom || 'root').trim() || 'root';
-    const [configs, stats] = await Promise.all([
+    const [configs, stats, interfaceAliases] = await Promise.all([
       fetchPolicyConfigs({ ...credentials, vdom }),
-      fetchPolicies(credentials)
+      fetchPolicies(credentials),
+      fetchInterfaceAliases({ ...credentials, vdom })
     ]);
-    res.json({ ...analyzePolicies({ configs: configs.configs, stats: stats.policies, options: { staleDays } }), vdom });
+    res.json({ ...analyzePolicies({ configs: configs.configs, stats: stats.policies, options: { staleDays } }), vdom, interfaceAliases });
   } catch (e) {
     if (!e.status) console.error(e);
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao analisar políticas FortiGate', detail: String(e.message || e) });
@@ -401,20 +422,8 @@ app.post('/api/fortigate-backup/policies/:id/run', async (req, res) => {
     const policies = await listFortigateBackupPolicies();
     const policy = policies.find((p) => p.id === policyId);
     if (!policy) return res.status(404).json({ error: 'Política não encontrada' });
-    const targets = await getFortigateBackupPolicyTargets(policyId);
-    const results = [];
-    for (const t of targets) {
-      try {
-        const fg = await getFortigate(t.fortigate_id);
-        if (!fg) throw new Error('FortiGate não encontrado');
-        // listFortigateBackupPolicies devolve camelCase: retention_days vinha undefined e a
-        // retenção da política era ignorada (caía no padrão de 30 dias).
-        const rec = await runFortigateBackup({ fortigate: fg, policyId, retentionDays: policy.retentionDays });
-        results.push({ fortigateId: fg.id, ok: true, backup: rec });
-      } catch (e) {
-        results.push({ fortigateId: t.fortigate_id, ok: false, error: e.message });
-      }
-    }
+    // Mesma rotina do agendador (um alvo por vez, retenção da política).
+    const results = await runFortigateBackupPolicy(policy);
     res.json({ results });
   } catch (e) {
     if (!e.status) console.error(e);

@@ -15,7 +15,9 @@ const RISK = { baixo: 'Baixo', medio: 'Médio', alto: 'Alto' };
 const CONF = { alta: 'Alta', media: 'Média', baixa: 'Baixa' };
 const STALE_OPTIONS = [30, 60, 90, 180, 365];
 
-const intfLabel = (p) => `${(p?.srcintf || []).join(', ') || '—'} → ${(p?.dstintf || []).join(', ') || '—'}`;
+// Interfaces com alias quando houver: "port2 (REDE-ESCRITORIO) → wan1".
+const intfNames = (list, aliases) => (list?.length ? list.map((n) => (aliases?.[n] ? `${n} (${aliases[n]})` : n)).join(', ') : '—');
+const intfLabel = (p, aliases) => `${intfNames(p?.srcintf, aliases)} → ${intfNames(p?.dstintf, aliases)}`;
 const policyLabel = (f) => f.policyName || `Policy ${f.policyid}`;
 const num = (v) => (v == null ? '—' : Number(v).toLocaleString('pt-BR'));
 
@@ -26,10 +28,10 @@ function scoreLevel(score) {
   return { label: 'Crítica', cls: 'bad' };
 }
 
-function findingText(f) {
+function findingText(f, aliases) {
   return [
     `[${SEV[f.severity]?.label || f.severity}] ${f.category}`,
-    `Política: ${policyLabel(f)} (ID ${f.policyid}, seq ${f.position ?? '—'}) · ${intfLabel(f.policy).toUpperCase()}`,
+    `Política: ${policyLabel(f)} (ID ${f.policyid}, seq ${f.position ?? '—'}) · ${intfLabel(f.policy, aliases).toUpperCase()}`,
     `Problema: ${f.problem}`,
     `Recomendação: ${f.recommendation}`,
     f.evidence?.length ? `Evidências: ${f.evidence.join(' | ')}` : null,
@@ -38,12 +40,12 @@ function findingText(f) {
   ].filter(Boolean).join('\n');
 }
 
-function exportCsv(findings, target) {
+function exportCsv(findings, target, aliases) {
   const head = ['Severidade', 'Categoria', 'ID', 'Política', 'Seq', 'Interfaces', 'Ação', 'Hits', 'Impacto', 'Risco da mudança', 'Confiança', 'Problema', 'Recomendação', 'Evidências', 'Validação'];
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const lines = findings.map((f) => [
     SEV[f.severity]?.label || f.severity, f.category, f.policyid, policyLabel(f), f.position ?? '',
-    intfLabel(f.policy).toUpperCase(), f.policy?.action || '', f.policy?.hitCount ?? '',
+    intfLabel(f.policy, aliases).toUpperCase(), f.policy?.action || '', f.policy?.hitCount ?? '',
     IMPACT[f.impact] || f.impact, RISK[f.changeRisk] || f.changeRisk, CONF[f.confidence] || f.confidence,
     f.problem, f.recommendation, (f.evidence || []).join(' | '), f.validation
   ].map(esc).join(';'));
@@ -110,6 +112,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
 
   const summary = analysis?.summary || null;
   const findings = useMemo(() => analysis?.findings || [], [analysis]);
+  const aliases = analysis?.interfaceAliases || {};
 
   // Categorias com a maior severidade presente (para a cor do marcador).
   const categories = useMemo(() => {
@@ -129,9 +132,10 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
     if (impact && f.impact !== impact) return false;
     if (category && f.category !== category) return false;
     if (!term) return true;
-    return [f.policyName, f.policyid, f.category, f.problem, ...(f.policy?.srcintf || []), ...(f.policy?.dstintf || [])]
+    const names = [...(f.policy?.srcintf || []), ...(f.policy?.dstintf || [])];
+    return [f.policyName, f.policyid, f.category, f.problem, ...names, ...names.map((n) => aliases[n])]
       .filter((v) => v != null).join(' ').toLowerCase().includes(term);
-  }), [findings, severity, impact, category, term]);
+  }), [findings, severity, impact, category, term, aliases]);
 
   const byPolicy = useMemo(() => {
     const map = new Map();
@@ -156,7 +160,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
   function expandAll() { setExpanded(new Set(groupBy === 'policy' ? byPolicy.map((g) => g.key) : shown.map((f) => f.id))); }
   function clearFilters() { setSeverity(''); setImpact(''); setCategory(''); setSearch(''); }
   function copy(finding) {
-    navigator.clipboard?.writeText(findingText(finding)).then(() => { setFlash('Achado copiado.'); setTimeout(() => setFlash(''), 2500); });
+    navigator.clipboard?.writeText(findingText(finding, aliases)).then(() => { setFlash('Achado copiado.'); setTimeout(() => setFlash(''), 2500); });
   }
 
   const renderFinding = (f, { showPolicy = true } = {}) => {
@@ -171,7 +175,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
             {showPolicy && (
               <span className="fga-item-policy">
                 {policyLabel(f)} <i>ID {f.policyid} · seq {f.position ?? '—'}</i>
-                <em className="fgt-upper">{intfLabel(f.policy)}</em>
+                <em className="fgt-upper">{intfLabel(f.policy, aliases)}</em>
               </span>
             )}
           </span>
@@ -206,7 +210,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
               </select>
             </label>
             <button className="ghost" onClick={onRerun} disabled={loading}>{loading ? 'Analisando…' : '↻ Recalcular'}</button>
-            <button className="ghost" onClick={() => exportCsv(shown, target)} disabled={!shown.length}>Exportar CSV</button>
+            <button className="ghost" onClick={() => exportCsv(shown, target, aliases)} disabled={!shown.length}>Exportar CSV</button>
             <button className="ghost" onClick={onClose} aria-label="Fechar">✕</button>
           </div>
         </header>
@@ -289,7 +293,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
                                 <i className={`fga-dot ${topSev.cls}`} />
                                 <span className="fga-item-title">
                                   <b>{policyLabel(g.head)}{p.status === 'disable' && <span className="fgt-tag off">Desabilitada</span>}</b>
-                                  <span className="fga-item-policy"><i>ID {g.head.policyid} · seq {g.head.position ?? '—'}</i><em className="fgt-upper">{intfLabel(p)}</em></span>
+                                  <span className="fga-item-policy"><i>ID {g.head.policyid} · seq {g.head.position ?? '—'}</i><em className="fgt-upper">{intfLabel(p, aliases)}</em></span>
                                 </span>
                                 <span className="fga-pgroup-stats">
                                   {p.action && <span className={`fgt-action ${p.action}`}>{p.action === 'accept' ? 'ACEITAR' : p.action === 'deny' ? 'NEGAR' : p.action}</span>}

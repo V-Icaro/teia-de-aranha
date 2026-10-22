@@ -22,6 +22,24 @@ const MAX_OBJECTS = 5;
 const intf = (list) => (list?.length ? list.join(', ') : '—');
 const num = (value) => Number(value || 0).toLocaleString('pt-BR');
 
+// Interface com alias: "port2 (REDE-ESCRITORIO)". Sem alias, só o nome.
+const intfLabel = (name, aliases) => (aliases?.[name] ? `${name} (${aliases[name]})` : name);
+
+function IntfList({ names, aliases }) {
+  if (!names?.length) return <span className="fgt-intf">—</span>;
+  return (
+    <span className="fgt-intf">
+      {names.map((name, i) => (
+        <Fragment key={name}>
+          {i > 0 && ', '}
+          {name}
+          {aliases?.[name] && <small className="fgt-alias"> ({aliases[name]})</small>}
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
 function dateValue(value) {
   if (!value) return '—';
   const n = Number(value);
@@ -29,11 +47,12 @@ function dateValue(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('pt-BR');
 }
 
-function matchesSearch(policy, term) {
+function matchesSearch(policy, term, aliases) {
   if (!term) return true;
+  const intfNames = [...policy.srcintf, ...policy.dstintf];
   const haystack = [
     policy.name, policy.policyid, policy.comments, policy.schedule, policy.action,
-    ...policy.srcintf, ...policy.dstintf, ...policy.srcaddr, ...policy.dstaddr,
+    ...intfNames, ...intfNames.map((n) => aliases?.[n]), ...policy.srcaddr, ...policy.dstaddr,
     ...policy.service, ...policy.securityProfiles.map((p) => p.name)
   ].filter((v) => v != null).join(' ').toLowerCase();
   return haystack.includes(term);
@@ -59,6 +78,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [sort, setSort] = useState('position');
   const [srcFilter, setSrcFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState(''); // '' | 'enable' | 'disable'
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState(() => new Set());
 
@@ -68,6 +88,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
   // Troca de firewall: zera filtros e grupos abertos (as interfaces mudam).
   useEffect(() => {
     setSrcFilter('');
+    setStatusFilter('');
     setSearch('');
     setExpanded(new Set());
   }, [firewallId]);
@@ -88,6 +109,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
   }, [firewallId, vdom, reloadKey]);
 
   const policies = data?.policies || [];
+  const aliases = data?.interfaceAliases || {};
 
   // Interfaces de origem presentes na lista, com a quantidade de regras.
   const srcInterfaces = useMemo(() => {
@@ -105,13 +127,16 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
     const map = new Map();
     for (const policy of policies) {
       if (srcFilter && !policy.srcintf.includes(srcFilter)) continue;
-      if (!matchesSearch(policy, term)) continue;
+      if (statusFilter === 'disable' && policy.status !== 'disable') continue;
+      if (statusFilter === 'enable' && policy.status === 'disable') continue;
+      if (!matchesSearch(policy, term, aliases)) continue;
       const src = intf(policy.srcintf);
       const dst = intf(policy.dstintf);
       const key = `${src}\u0000${dst}`;
-      if (!map.has(key)) map.set(key, { key, src, dst, rows: [], hits: 0, bytes: 0, metric: 0 });
+      if (!map.has(key)) map.set(key, { key, src, dst, srcNames: policy.srcintf, dstNames: policy.dstintf, rows: [], disabled: 0, hits: 0, bytes: 0, metric: 0 });
       const group = map.get(key);
       group.rows.push(policy);
+      if (policy.status === 'disable') group.disabled += 1;
       group.hits += policy.hitCount;
       group.bytes += policy.bytes;
       if (sorter.metric) group.metric = sort === 'lastUsed' ? Math.max(group.metric, sorter.metric(policy)) : group.metric + sorter.metric(policy);
@@ -122,7 +147,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
     const byName = (a, b) => a.src.localeCompare(b.src, 'pt-BR', { sensitivity: 'base' }) || a.dst.localeCompare(b.dst, 'pt-BR', { sensitivity: 'base' });
     list.sort(sorter.metric ? (a, b) => (b.metric - a.metric) || byName(a, b) : byName);
     return list;
-  }, [policies, srcFilter, term, sort]);
+  }, [policies, srcFilter, statusFilter, term, sort, aliases]);
 
   const shownCount = groups.reduce((sum, group) => sum + group.rows.length, 0);
   // Com busca ativa, todos os grupos encontrados ficam abertos.
@@ -149,7 +174,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
           {data && <>
             <span><b>{policies.length}</b>políticas</span>
             <span><b>{srcInterfaces.length}</b>interfaces de origem</span>
-            <span><b>{policies.filter((p) => p.status === 'disable').length}</b>desabilitadas</span>
+            <span role="button" tabIndex={0} style={{ cursor: 'pointer' }} title="Filtrar desabilitadas" onClick={() => setStatusFilter((s) => (s === 'disable' ? '' : 'disable'))}><b>{policies.filter((p) => p.status === 'disable').length}</b>desabilitadas</span>
             <span><b>{policies.filter((p) => !p.hitCount).length}</b>sem hits</span>
           </>}
           <button className="ghost" onClick={() => setReloadKey((k) => k + 1)} disabled={loading}>{loading ? 'Atualizando…' : '↻ Atualizar'}</button>
@@ -161,7 +186,15 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
           <span>Interface de origem</span>
           <select value={srcFilter} onChange={(e) => setSrcFilter(e.target.value)}>
             <option value="">Todas ({policies.length})</option>
-            {srcInterfaces.map(([name, count]) => <option key={name} value={name}>{name.toUpperCase()} ({count})</option>)}
+            {srcInterfaces.map(([name, count]) => <option key={name} value={name}>{name.toUpperCase()}{aliases[name] ? ` (${aliases[name]})` : ''} ({count})</option>)}
+          </select>
+        </label>
+        <label className="dashboard-period-select">
+          <span>Status</span>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="">Todas</option>
+            <option value="enable">Ativas ({policies.filter((p) => p.status !== 'disable').length})</option>
+            <option value="disable">Desabilitadas ({policies.filter((p) => p.status === 'disable').length})</option>
           </select>
         </label>
         <label className="dashboard-period-select">
@@ -187,7 +220,7 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
         <>
           <p className="hint fgt-psummary">
             {shownCount} de {policies.length} políticas em {groups.length} pares de interface
-            {srcFilter && <> · origem <b className="fgt-upper">{srcFilter}</b></>}
+            {srcFilter && <> · origem <b className="fgt-upper">{srcFilter}</b>{aliases[srcFilter] && <> ({aliases[srcFilter]})</>}</>}
             {loading && ' · atualizando…'}
           </p>
           <div className="table-wrap fgt-ptable-wrap">
@@ -215,10 +248,15 @@ export default function FortigatePolicyTable({ firewall, onOpenPolicy }) {
                       <tr className={`fgt-group-row${open ? ' open' : ''}`} onClick={() => toggle(group.key)}>
                         <td colSpan={COLUMNS - 2}>
                           <span className="fgt-toggle" aria-hidden="true">{open ? '−' : '+'}</span>
-                          <span className="fgt-intf">{group.src}</span>
+                          <IntfList names={group.srcNames} aliases={aliases} />
                           <span className="fgt-arrow" aria-hidden="true">→</span>
-                          <span className="fgt-intf">{group.dst}</span>
+                          <IntfList names={group.dstNames} aliases={aliases} />
                           <span className="fgt-count">{group.rows.length}</span>
+                          {group.disabled > 0 && (
+                            <span className="fgt-group-off" title={`${group.disabled} política(s) desabilitada(s) neste par`}>
+                              {group.disabled === group.rows.length ? 'DESABILITADA' : `${group.disabled} DESABILITADA${group.disabled > 1 ? 'S' : ''}`}
+                            </span>
+                          )}
                         </td>
                         <td className="num">{num(group.hits)}</td>
                         <td className="num">{fmtBytes(group.bytes)}</td>

@@ -241,23 +241,8 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
 
             {tab === 'admins' && audit.adminsHidden && (
               <div className="fau-hidden-note">
-                <b>O FortiGate ocultou os administradores deste token</b>
-                <p>O perfil do token cadastrado (ex.: <code>super_admin_readonly</code>) não enxerga contas com privilégio maior, como as <code>super_admin</code>. A API devolve a lista vazia (e 404 ao pedir uma conta pelo nome). <b>O backup de configuração feito com este token também sai sem as seções de administradores</b>, ou seja, não restaura essas contas.</p>
-                <p>Para auditar (e ter backup completo), use um usuário de API com perfil <code>super_admin</code> e <b>trusted host restrito ao IP deste servidor</b>:</p>
-                <pre>{`config system api-user
-    edit "api-auditoria"
-        set accprofile "super_admin"
-        set vdom "root"
-        config trusthost
-            edit 1
-                set type ipv4-trusthost
-                set ipv4-trusthost <IP-do-servidor> 255.255.255.255
-            next
-        end
-    next
-end
-execute api-user generate-key api-auditoria`}</pre>
-                <p className="hint">Depois, em Firewalls e políticas → Editar, substitua o token. Esse perfil tem escrita: guarde o token como credencial sensível (ele já é cifrado com AES-256-GCM no banco).</p>
+                <b>Sem acesso aos administradores</b>
+                <p>O perfil do token cadastrado não permite listar os administradores deste FortiGate.</p>
               </div>
             )}
 
@@ -276,7 +261,7 @@ execute api-user generate-key api-auditoria`}</pre>
                             <td><SevPill severity={u.severity} /></td>
                             <td><b>{u.name}</b>{u.comments && <small>{u.comments}</small>}</td>
                             <td>{KIND_LABEL[u.kind]}</td>
-                            <td>{u.superAdmin ? <span className="fau-tag bad">super_admin</span> : (u.profile || '—')}</td>
+                            <td>{u.profile || '—'}{u.superAdmin && <small className="fau-public">privilégio total</small>}</td>
                             <td>{u.anywhere ? <span className="fau-tag bad">Qualquer lugar</span> : <Chips items={u.trustedHosts} className="mono" />}</td>
                             <td>{u.kind === 'api' ? <span className="fgt-muted">n/a</span> : u.twoFactor ? <span className="fau-tag ok">{u.twoFactor}</span> : <span className="fau-tag warn">Desabilitado</span>}</td>
                             <td><Chips items={u.vdoms} max={2} /></td>

@@ -345,10 +345,29 @@ function securityProfilesOf(security) {
 // Visão "Interface Pair View" do FortiGate: configuração da CMDB (interfaces,
 // endereços, serviço, ação, NAT, perfis, log) + contadores do monitor, na
 // ordem efetiva da lista. O agrupamento por par de interfaces fica na tela.
+// GET /api/v2/cmdb/system/interface — mapa nome → alias. Uma porta física pode
+// ter várias VLANs/sub-interfaces; o alias é o que identifica cada uma na prática.
+// Falha aqui não derruba a listagem de políticas (retorna mapa vazio).
+async function fetchInterfaceAliases({ host, token, vdom = 'root', port }) {
+  try {
+    const path = `/api/v2/cmdb/system/interface?vdom=${encodeURIComponent(vdom)}&format=name|alias|vdom`;
+    const json = await requestJson(host, path, token, { port });
+    const results = Array.isArray(json?.results) ? json.results : [];
+    const aliases = {};
+    for (const it of results) {
+      if (it?.name && it.alias) aliases[it.name] = String(it.alias);
+    }
+    return aliases;
+  } catch {
+    return {};
+  }
+}
+
 async function fetchPolicyTable({ host, token, vdom = 'root', port }) {
-  const [configs, stats] = await Promise.all([
+  const [configs, stats, interfaceAliases] = await Promise.all([
     fetchPolicyConfigs({ host, token, vdom, port }),
-    fetchPolicies({ host, token, vdom, port })
+    fetchPolicies({ host, token, vdom, port }),
+    fetchInterfaceAliases({ host, token, vdom, port })
   ]);
   const statsById = new Map(stats.policies.map((s) => [s.policyid, s]));
   const policies = configs.configs.map((c) => {
@@ -395,8 +414,9 @@ async function fetchPolicyTable({ host, token, vdom = 'root', port }) {
     version: stats.version,
     revision: configs.revision,
     total: policies.length,
+    interfaceAliases,
     policies
   };
 }
 
-module.exports = { requestJson, fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, normalizePolicy, normalizePolicyDetail };
+module.exports = { requestJson, fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, fetchInterfaceAliases, normalizePolicy, normalizePolicyDetail };

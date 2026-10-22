@@ -10,7 +10,32 @@ import FortigatePolicyTable from './screens/FortigatePolicies.jsx';
 import FortigateAnalysis from './screens/FortigateAnalysis.jsx';
 import FortigateAuditScreen from './screens/FortigateAudit.jsx';
 
-import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
+import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchServerTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
+
+// Relógio do servidor (backend). É esta hora, e não a do navegador, que o
+// agendador de backups usa. Sincroniza a cada 5 min e avança localmente.
+function ServerClock() {
+  const [info, setInfo] = useState(null); // { epochMs, timeZone, local } + skew
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const sync = () => fetchServerTime().then((r) => { if (alive) setInfo({ ...r, skew: r.epochMs - Date.now() }); }).catch(() => { if (alive) setInfo((prev) => prev && { ...prev, stale: true }); });
+    sync();
+    const syncTimer = setInterval(sync, 5 * 60 * 1000);
+    const tickTimer = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => { alive = false; clearInterval(syncTimer); clearInterval(tickTimer); };
+  }, []);
+  if (!info) return <span className="fgt-clock" title="Hora do servidor">servidor: —</span>;
+  const now = new Date(Date.now() + info.skew);
+  const text = now.toLocaleString('pt-BR', { timeZone: info.timeZone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const browserDiff = Math.round(info.skew / 60000);
+  return (
+    <span className={`fgt-clock${info.stale ? ' stale' : ''}`} title={`Hora do servidor (fuso ${info.timeZone}). Os backups agendados usam este relógio.${browserDiff ? `\nDiferença para o navegador: ${browserDiff > 0 ? '+' : ''}${browserDiff} min` : ''}`}>
+      <i aria-hidden="true">⏱</i> servidor {text} <small>{info.timeZone}</small>
+      {Math.abs(browserDiff) >= 2 && <b title="Relógio do servidor difere do navegador">{browserDiff > 0 ? '+' : ''}{browserDiff} min</b>}
+    </span>
+  );
+}
 
 const PRESETS = [
   { label: 'Últimos 5 min', minutes: 5 },
@@ -2167,6 +2192,7 @@ cy.current.on('tap', (evt) => {
             <button className={`fgt-subnav-tab${fgTab === 'firewalls' ? ' active' : ''}`} onClick={() => setFgTab('firewalls')}>Firewalls e políticas</button>
             <button className={`fgt-subnav-tab${fgTab === 'backups' ? ' active' : ''}`} onClick={() => setFgTab('backups')}>Backups</button>
             <button className={`fgt-subnav-tab${fgTab === 'audit' ? ' active' : ''}`} onClick={() => setFgTab('audit')}>Auditoria</button>
+            <ServerClock />
           </nav>
           <div className="fgt-shell-body">
             {fgTab === 'firewalls' && <FortigatePage />}

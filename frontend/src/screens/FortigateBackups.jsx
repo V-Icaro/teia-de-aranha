@@ -185,6 +185,7 @@ export default function FortigateBackupsScreen({ firewalls: firewallsProp = [] }
                             {p.runAllDays ? <span className="fgb-chip">Todos os dias</span> : <span className="fgb-days">{DAYS.map((d, i) => <i key={d} className={(p.daysOfWeek || []).includes(i) ? 'on' : ''}>{d[0]}</i>)}</span>}
                           </div>
                           <small>{next ? `Próxima: ${next.toLocaleString('pt-BR', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : 'Sem próxima execução'}</small>
+                          <small title="Última execução automática pelo agendador">Última auto: {p.lastRunAt ? fmtDate(p.lastRunAt) : 'nunca'}</small>
                         </td>
                         <td>{p.retentionDays} dias</td>
                         <td>
