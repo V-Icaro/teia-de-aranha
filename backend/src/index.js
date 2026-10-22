@@ -60,9 +60,76 @@ if (process.env.BACKUP_SCHEDULER !== '0') {
 // EVENTS_COLLECT_MIN=0 desliga a coleta periódica.
 dbInit().then((ok) => { if (ok) fgEvents.startEventCollector(); });
 
+const auth = require('./auth');
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+
+// ---- autenticação --------------------------------------------------------
+// Cria tabelas e o admin inicial no boot; sessões vencidas são apagadas de hora em hora.
+dbInit().then(async (ok) => {
+  if (!ok) return;
+  try { await auth.ensureSchema(); } catch (e) { console.error('[auth] schema:', e.message); }
+  setInterval(() => auth.purgeSessions().catch(() => {}), 3600e3);
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const user = await auth.login(req.body || {}, req, res);
+    res.json({ user });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha no login' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try { await auth.destroySession(req, res); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: 'Falha ao sair' }); }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const user = await auth.sessionUser(req, res);
+    if (!user) return res.status(401).json({ error: 'Não autenticado' });
+    res.json({ user });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Falha ao consultar sessão' }); }
+});
+
+// Troca da própria senha (também usada na troca obrigatória do primeiro acesso).
+app.post('/api/auth/password', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const user = await auth.sessionUser(req, res);
+    if (!user) return res.status(401).json({ error: 'Não autenticado' });
+    await auth.changePassword(user.id, req.body || {});
+    res.json({ ok: true, user: { ...user, mustChangePassword: false } });
+  } catch (e) {
+    if (!e.status) console.error(e);
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao trocar a senha' });
+  }
+});
+
+// A partir daqui tudo em /api exige sessão (exceto /api/auth/* e /api/health).
+app.use(auth.requireAuth({ dbInit }));
+
+// Gestão de usuários (só admin).
+app.get('/api/auth/users', auth.requireAdmin, async (_req, res) => {
+  try { res.json({ users: await auth.listUsers() }); } catch (e) { console.error(e); res.status(500).json({ error: 'Falha ao listar usuários' }); }
+});
+app.post('/api/auth/users', auth.requireAdmin, async (req, res) => {
+  try { res.status(201).json({ user: await auth.createUser(req.body || {}) }); }
+  catch (e) { if (!e.status) console.error(e); res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao criar usuário' }); }
+});
+app.patch('/api/auth/users/:id', auth.requireAdmin, async (req, res) => {
+  try { res.json({ user: await auth.updateUser(Number(req.params.id), req.body || {}, req.user.id) }); }
+  catch (e) { if (!e.status) console.error(e); res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao atualizar usuário' }); }
+});
+app.delete('/api/auth/users/:id', auth.requireAdmin, async (req, res) => {
+  try { res.json(await auth.deleteUser(Number(req.params.id), req.user.id)); }
+  catch (e) { if (!e.status) console.error(e); res.status(e.status || 500).json({ error: e.status ? e.message : 'Falha ao excluir usuário' }); }
+});
 
 // Relógio do servidor: os agendamentos de backup são avaliados com esta hora
 // (convertida para o fuso de cada política), não com a hora do navegador.

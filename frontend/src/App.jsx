@@ -9,6 +9,7 @@ import FortigateBackupsScreen from './screens/FortigateBackups.jsx';
 import FortigatePolicyTable from './screens/FortigatePolicies.jsx';
 import FortigateAnalysis from './screens/FortigateAnalysis.jsx';
 import FortigateAuditScreen from './screens/FortigateAudit.jsx';
+import { useAuth } from './auth.jsx';
 
 import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchServerTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
 
@@ -539,6 +540,7 @@ export default function App() {
   const [ipModal, setIpModal] = useState(null); // { loading, ip } | dossiê | { ip, error }
   const [cmpOpen, setCmpOpen] = useState(false);
   const [pairsOpen, setPairsOpen] = useState(false);
+  const { user, logout } = useAuth();
 
   // Página "Reputação": base e cobertura do cache.
   const [repDbOpen, setRepDbOpen] = useState(false);
@@ -2178,8 +2180,9 @@ cy.current.on('tap', (evt) => {
               <button className={`tool${subnetsOpen ? ' active' : ''}`} onClick={() => setSubnetsOpen(true)} title="Sub-redes monitoradas"><span className="ti" aria-hidden="true">▦</span>Subnets</button>
               <button className="tool" onClick={() => { setLkIp(''); setLkData(null); setLkError(''); setLkOpen(true); }} title="Buscar qualquer IP no histórico (mesmo fora do mapa)"><span className="ti" aria-hidden="true">⌕</span>Buscar IP</button>
                  <button className={`tool${!inventoryOpen && !dashboardOpen && !repDbOpen && !fortigateOpen ? ' active' : ''}`} onClick={() => { setInventoryOpen(false); openMap(); }} title="Abrir mapa de conexões"><span className="ti" aria-hidden="true">⌖</span>Mapa</button>
-                 <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setFgTab('firewalls'); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate, políticas e backups">FortiGate</button>
-            </div>
+                  <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setFgTab('firewalls'); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate, políticas e backups">FortiGate</button>
+                  <button className="tool" onClick={logout} title={`Sair (${user?.username || ''})`}><span className="ti" aria-hidden="true"> </span>Sair</button>
+             </div>
           </div>
         </div>
         <div className={`loadbar ${loading ? 'on' : ''}`}><i /></div>
