@@ -8,6 +8,7 @@ const { requestJson } = require('./fortigate');
 
 const ROWS = Math.max(50, Math.min(5000, Number.parseInt(process.env.FORTIGATE_TRAFFIC_ROWS || '1000', 10) || 1000));
 const COLLECT_MIN = Math.max(0, Number.parseInt(process.env.TRAFFIC_COLLECT_MIN || '5', 10) || 0);
+const config = require('./config');
 
 async function ensureSchema() {
   await db.pool.query(`create table if not exists fortigate_traffic (
@@ -106,7 +107,20 @@ async function collectFortigateTraffic(fg) {
   return { read: rows.length, inserted };
 }
 
+async function purgeOld() {
+  const days = Number(await config.get('traffic_retention_days', '7')) || 7;
+  if (days <= 0) return;
+  await ensureSchema();
+  await db.pool.query('delete from fortigate_traffic where event_at < now() - ($1::int * interval \'1 day\')', [days]);
+}
+
 async function collectAll() {
+  const enabled = await config.get('traffic_collect_enabled', '0');
+  if (enabled === '0') {
+    console.log('[fgt-traffic] coleta desativada nas configurações');
+    return [];
+  }
+  await purgeOld();
   const list = await db.listFortigates();
   const out = [];
   for (const f of list) {
@@ -147,4 +161,4 @@ async function queryTrafficByPolicy({ fortigateId, policyId, limit = 50 } = {}) 
   return { srcIps: src.rows, dstIps: dst.rows, services: svc.rows };
 }
 
-module.exports = { ensureSchema, collectFortigateTraffic, collectAll, startTrafficCollector, queryTrafficByPolicy };
+module.exports = { ensureSchema, collectFortigateTraffic, collectAll, startTrafficCollector, queryTrafficByPolicy, purgeOld };

@@ -419,4 +419,26 @@ async function fetchPolicyTable({ host, token, vdom = 'root', port }) {
   };
 }
 
-module.exports = { requestJson, fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, fetchInterfaceAliases, normalizePolicy, normalizePolicyDetail };
+async function fetchSystemStatus({ host, token, vdom = 'root', port }) {
+  const path = `/api/v2/monitor/system/status?vdom=${encodeURIComponent(vdom || 'root')}`;
+  const json = await requestJson(host, path, token, { port });
+  let model = json?.results?.model || json?.model || json?.results?.platform || null;
+  if (model && /^FGT/i.test(model)) model = 'Fortigate-' + model.replace(/^FGT/i, '');
+  return { model, version: json?.results?.version || json?.version || null, serial: json?.results?.serial || json?.serial || null };
+}
+
+async function fetchInterfaces({ host, token, vdom = 'root', port }) {
+  const path = `/api/v2/monitor/system/interface?vdom=${encodeURIComponent(vdom || 'root')}`;
+  const json = await requestJson(host, path, token, { port });
+  const results = Array.isArray(json?.results) ? json.results : Array.isArray(json) ? json : [];
+  return results.map((r) => ({
+    name: r.name || r.interface || null,
+    status: r.status || (r.link ? 'up' : 'down'),
+    link: r.link === true || r.link === 'up' || r.status === 'up',
+    speed: r.speed || null,
+    duplex: r.duplex || null,
+    ip: r.ip || null
+  })).filter((r) => r.name);
+}
+
+module.exports = { requestJson, fetchPolicies, topPolicies, fetchPolicyDetail, fetchPolicyConfigs, fetchPolicyTable, fetchInterfaceAliases, normalizePolicy, normalizePolicyDetail, fetchInterfaces, fetchSystemStatus };

@@ -135,11 +135,7 @@ async function collectAll() {
   try {
     const fgTraffic = require('./fortigate-traffic');
     await fgTraffic.ensureSchema();
-    const trafficOut = await fgTraffic.collectAll();
-    for (const r of trafficOut) {
-      if (r.inserted) console.log(`[fgt-traffic] firewall ${r.fortigateId}: ${r.inserted} registro(s) novo(s) de ${r.read} lidos`);
-      if (r.error) console.error(`[fgt-traffic] firewall ${r.fortigateId}: ${r.error}`);
-    }
+    await fgTraffic.collectAll();
   } catch (e) {
     console.error('[fgt-traffic]', e.message);
   }

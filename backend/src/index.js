@@ -391,6 +391,30 @@ app.get('/api/fortigate/:id/policy/:policyId', async (req, res) => {
 
 // Auditoria de usuários (admins + tokens de API) e interfaces (serviços de
 // gerência expostos). Somente leitura.
+app.get('/api/fortigate/:id/system-status', async (req, res) => {
+  try {
+    const fg = await getFortigate(Number(req.params.id));
+    const { fetchSystemStatus } = require('./fortigate');
+    const data = await fetchSystemStatus({ host: fg.host, token: fg.token, vdom: fg.vdom || 'root', port: fg.port });
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Falha ao consultar status do FortiGate' });
+  }
+});
+
+app.get('/api/fortigate/:id/interfaces', async (req, res) => {
+  try {
+    const fg = await getFortigate(Number(req.params.id));
+    const { fetchInterfaces } = require('./fortigate');
+    const data = await fetchInterfaces({ host: fg.host, token: fg.token, vdom: fg.vdom || 'root', port: fg.port });
+    res.json({ interfaces: data });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Falha ao consultar interfaces' });
+  }
+});
+
 app.get('/api/fortigate/:id/audit', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
@@ -433,6 +457,26 @@ app.get('/api/fortigate/:id/traffic', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Falha ao consultar tráfego' });
   }
+});
+
+app.get('/api/config', async (_req, res) => {
+  try {
+    const cfg = require('./config');
+    await cfg.ensureSchema();
+    const enabled = await cfg.get('traffic_collect_enabled', '0');
+    const days = await cfg.get('traffic_retention_days', '7');
+    res.json({ trafficCollectEnabled: enabled !== '0', trafficRetentionDays: Number(days) || 7 });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Falha ao ler configuração' }); }
+});
+
+app.put('/api/config', async (req, res) => {
+  try {
+    const cfg = require('./config');
+    await cfg.ensureSchema();
+    if (req.body?.trafficCollectEnabled !== undefined) await cfg.set('traffic_collect_enabled', req.body.trafficCollectEnabled ? '1' : '0');
+    if (req.body?.trafficRetentionDays !== undefined) await cfg.set('traffic_retention_days', Number(req.body.trafficRetentionDays) || 7);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Falha ao salvar configuração' }); }
 });
 
 app.get('/api/fortigate-events', async (req, res) => {

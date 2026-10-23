@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
+import FortigatePortMap from './FortigatePortMap.jsx';
 import { fmtBytes, fetchFortigates, fetchFortigateAudit, fetchFortigateEvents, collectFortigateEvents } from '../api.js';
 
 // Auditoria de usuários e interfaces do FortiGate (somente leitura):
@@ -280,6 +281,7 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
   const [search, setSearch] = useState('');
   const [onlyIssues, setOnlyIssues] = useState(false);
   const [ifaceKind, setIfaceKind] = useState('all'); // all | physical | vlan | exposed
+  const [model, setModel] = useState('');
   const [expanded, setExpanded] = useState(() => new Set());
 
   useEffect(() => {
@@ -302,6 +304,13 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
     } finally { setLoading(false); }
   }
   useEffect(() => { if (fwId) runAudit(fwId); }, [fwId]); // eslint-disable-line
+  useEffect(() => {
+    if (!fwId) return;
+    fetch(`/api/fortigate/${fwId}/system-status`, { credentials: 'include' })
+      .then((r) => r.json())
+      .then((d) => setModel(d.model || ''))
+      .catch(() => setModel(''));
+  }, [fwId]);
 
   const toggle = (key) => setExpanded((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   const term = search.trim().toLowerCase();
@@ -348,6 +357,8 @@ export default function FortigateAuditScreen({ firewalls: firewallsProp = [] }) 
       {!firewalls.length && <div className="fgb-empty"><b>Nenhum FortiGate cadastrado</b><span>Cadastre um firewall na aba "Firewalls e políticas".</span></div>}
       {error && <p className="error">{error}</p>}
       {loading && !audit && <div className="fga-loading"><i />Lendo a configuração de {fw?.name || 'FortiGate'}…</div>}
+
+      <FortigatePortMap model={model} interfaces={audit?.interfaces || []} />
 
       {audit && (
         <>

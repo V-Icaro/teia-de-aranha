@@ -9,6 +9,7 @@ import FortigateBackupsScreen from './screens/FortigateBackups.jsx';
 import FortigatePolicyTable from './screens/FortigatePolicies.jsx';
 import FortigateAnalysis from './screens/FortigateAnalysis.jsx';
 import FortigateAuditScreen from './screens/FortigateAudit.jsx';
+import SettingsScreen from './screens/Settings.jsx';
 import { useAuth } from './auth.jsx';
 
 import { colorFor, widthFor, fmtBytes, timeAgo, fmtTime, fetchServerTime, fetchGraph, fetchHost, fetchIpInfo, compareHosts, topPairs, lookupIp, harvestRegions, fetchReputationDb, fetchRisk, fetchNewExternal, fetchSessions, fetchInbound, fetchBeacon, fetchDashboardApplications, fetchApplicationConnections, fetchDashboardPorts, fetchDashboardConversations, fetchFortigates, createFortigate, updateFortigate, deleteFortigate, testFortigate, fetchFortigatePolicyDetail, fetchFortigateAnalysis, getWatchSubnets, addWatchSubnet, patchWatchSubnet, delWatchSubnet, fetchInventory, createInventoryServer, renameInventoryServer, deleteInventoryServer, addServerIp, deleteServerIp, createInventoryApplication, renameInventoryApplication, deleteInventoryApplication, addApplicationListener, deleteApplicationListener, addExpectedApplicationClient, deleteExpectedApplicationClient, isPublicIp, checkReputation, fetchRepCoverage, VERDICTS, subnetOf, cidrContains } from './api.js';
@@ -510,7 +511,7 @@ export default function App() {
   const [riskCount, setRiskCount] = useState(null); // IPs destacados pelo filtro de risco
   const pendingSelectRef = useRef(null); // IP buscado que ainda não estava no mapa
   const [focusSubnet, setFocusSubnet] = useState(null);
-  const [fgTab, setFgTab] = useState('firewalls'); // firewalls | backups | audit
+  const [fgTab, setFgTab] = useState('firewalls'); // firewalls | backups | audit | settings
   const [focusHost, setFocusHost] = useState(null); // mapa mostra só este host + vizinhos
   const [subnetEmpty, setSubnetEmpty] = useState(''); // sub-rede escolhida sem tráfego na janela
   const [repMap, setRepMap] = useState({});
@@ -706,7 +707,7 @@ export default function App() {
   // Inventário manual de servidores e listeners. IDs são do Postgres; o
   // formulário pede apenas nome/IP e os detalhes de aplicação.
   const [inventoryOpen, setInventoryOpen] = useState(false);
-  const [fortigateOpen, setFortigateOpen] = useState(false);
+  const [fortigateOpen, setFortigateOpen] = useState(true);
   const inventoryReturnMapRef = useRef(false);
   const inventoryNewApplicationRef = useRef(null);
   const [inventoryData, setInventoryData] = useState([]);
@@ -721,7 +722,7 @@ export default function App() {
   const [listenerDrafts, setListenerDrafts] = useState({});
   const [expectedClientDrafts, setExpectedClientDrafts] = useState({});
   const [inventoryEdit, setInventoryEdit] = useState(null);
-  const [dashboardOpen, setDashboardOpen] = useState(true);
+  const [dashboardOpen, setDashboardOpen] = useState(false);
   const [dashboardTab, setDashboardTab] = useState('applications');
   const [dashboardServerId, setDashboardServerId] = useState(null);
   const [dashboardData, setDashboardData] = useState(null);
@@ -2180,8 +2181,8 @@ cy.current.on('tap', (evt) => {
               <button className={`tool${subnetsOpen ? ' active' : ''}`} onClick={() => setSubnetsOpen(true)} title="Sub-redes monitoradas"><span className="ti" aria-hidden="true">▦</span>Subnets</button>
               <button className="tool" onClick={() => { setLkIp(''); setLkData(null); setLkError(''); setLkOpen(true); }} title="Buscar qualquer IP no histórico (mesmo fora do mapa)"><span className="ti" aria-hidden="true">⌕</span>Buscar IP</button>
                  <button className={`tool${!inventoryOpen && !dashboardOpen && !repDbOpen && !fortigateOpen ? ' active' : ''}`} onClick={() => { setInventoryOpen(false); openMap(); }} title="Abrir mapa de conexões"><span className="ti" aria-hidden="true">⌖</span>Mapa</button>
-                  <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setFgTab('firewalls'); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate, políticas e backups">FortiGate</button>
-                  <button className="tool" onClick={logout} title={`Sair (${user?.username || ''})`}><span className="ti" aria-hidden="true"> </span>Sair</button>
+                  <button className={`tool${fortigateOpen ? ' active' : ''}`} onClick={() => { setFortigateOpen(true); setFgTab('firewalls'); setInventoryOpen(false); setRepDbOpen(false); setDashboardOpen(false); setExpOpen(false); }} title="Firewalls FortiGate, políticas e backups"><span className="ti" aria-hidden="true">🛡</span>FortiGate</button>
+                  <button className="tool" onClick={logout} title={`Sair (${user?.username || ''})`}><span className="ti" aria-hidden="true">⏻</span>Sair</button>
              </div>
           </div>
         </div>
@@ -2195,12 +2196,14 @@ cy.current.on('tap', (evt) => {
             <button className={`fgt-subnav-tab${fgTab === 'firewalls' ? ' active' : ''}`} onClick={() => setFgTab('firewalls')}>Firewalls e políticas</button>
             <button className={`fgt-subnav-tab${fgTab === 'backups' ? ' active' : ''}`} onClick={() => setFgTab('backups')}>Backups</button>
             <button className={`fgt-subnav-tab${fgTab === 'audit' ? ' active' : ''}`} onClick={() => setFgTab('audit')}>Auditoria</button>
+            <button className={`fgt-subnav-tab${fgTab === 'settings' ? ' active' : ''}`} onClick={() => setFgTab('settings')}>Configurações</button>
             <ServerClock />
           </nav>
           <div className="fgt-shell-body">
             {fgTab === 'firewalls' && <FortigatePage />}
             {fgTab === 'backups' && <FortigateBackupsScreen firewalls={fortigates} />}
             {fgTab === 'audit' && <FortigateAuditScreen firewalls={fortigates} />}
+            {fgTab === 'settings' && <SettingsScreen />}
           </div>
         </div>
       )}

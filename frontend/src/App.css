@@ -1497,6 +1497,38 @@ button.inv-ctx-app-head:hover:not(:disabled) { border: 0; background: #f4f7f9; b
 .auth-card label { display: grid; gap: 4px; font-size: 13px; }
 .auth-card input { padding: 8px 10px; border: 1px solid #cfc7b8; border-radius: 8px; }
 .auth-actions { display: flex; gap: 8px; }
+.fau-device { display: flex; gap: 16px; align-items: center; margin: 12px 0; padding: 12px; border: 1px solid #d8d2c6; border-radius: 12px; background: #fff; }
+.fau-device-box { width: 150px; height: 90px; border: 2px solid #2f3a3e; border-radius: 10px; display: grid; place-items: center; text-align: center; background: #f4f1ea; }
+.fau-device-box b { font-size: 14px; }
+.fau-device-box small { font-size: 11px; color: #6b6258; }
+.fau-device-ports { display: flex; flex-wrap: wrap; gap: 8px; }
+.fau-port { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 8px; border: 1px solid #cfc7b8; border-radius: 6px; background: #fff; }
+.fau-port i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.fau-port.up i { background: #1c8a58; }
+.fau-port.down i { background: #9a9a9a; }
+.fgt-portmap { border: 1px solid #3a3a3a; border-radius: 12px; padding: 12px; background: #fff; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
+.fgt-portmap-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.fgt-portmap-brand { font-size: 11px; color: #b3261e; font-weight: 700; }
+.fgt-portmap-grid { display: grid; gap: 8px; }
+.fgt-port { border: 1px solid #cfc7b8; border-radius: 6px; background: #f7f7f7; padding: 4px; display: grid; place-items: center; gap: 2px; cursor: pointer; }
+.fgt-port-icon { width: 18px; height: 12px; border: 1px solid #6b6258; border-radius: 2px; background: #d9d9d9; }
+.fgt-port.up .fgt-port-icon { background: #1c8a58; border-color: #1c8a58; }
+.fgt-port.down .fgt-port-icon { background: #9a9a9a; border-color: #9a9a9a; }
+.fgt-port.missing { opacity: .45; }
+.fgt-port-name { font-size: 10px; }
+.fgt-portmap-extra { margin-top: 8px; font-size: 11px; color: #6b6258; }
+.fgt-portmap-panel { border: 1px solid #3a3a3a; border-radius: 12px; padding: 12px; background: #fff; box-shadow: 0 4px 14px rgba(0,0,0,.08); overflow-x: auto; }
+.fgt-portmap-title { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.fgt-portmap-brand { font-size: 11px; color: #b3261e; font-weight: 700; }
+.fgt-portmap-canvas { position: relative; height: 150px; min-width: 760px; }
+.fgt-rj45 { position: absolute; display: grid; gap: 2px; place-items: center; background: transparent; border: 0; cursor: pointer; padding: 0; }
+.fgt-rj45 svg rect { fill: #d9d9d9; stroke: #555; }
+.fgt-rj45 .fgt-rj45-inner { fill: #f2f2f2; }
+.fgt-rj45.up svg rect:first-child { fill: #c9e7d6; stroke: #1c8a58; }
+.fgt-rj45.up .fgt-rj45-inner { fill: #eaf7f0; }
+.fgt-rj45.down svg rect:first-child { fill: #e3e3e3; stroke: #9a9a9a; }
+.fgt-rj45.missing { opacity: .45; }
+.fgt-rj45-label { font-size: 10px; color: #2f3a3e; font-weight: 600; }
 .fau-lastlogin { display: inline-flex; flex-direction: column; gap: 1px; line-height: 1.2; }
 .fau-lastlogin b { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; color: #2f3a3e; white-space: nowrap; }
 .fau-lastlogin small { color: #89938e; font-size: 10px; }

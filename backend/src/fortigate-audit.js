@@ -244,8 +244,9 @@ function auditInterfaces(rows, stats = new Map()) {
     const role = i.role || 'undefined';
     const exposed = role === 'wan' || publicIp;
     const services = String(i.allowaccess || '').split(/\s+/).filter(Boolean);
-    const up = i.status !== 'down';
     const findings = [];
+    const st = stats.get(i.name) || null;
+    const up = st ? st.link === 'up' : (i.status !== 'down');
     const serviceRisk = services.map((svc) => {
       const info = SERVICE_INFO[svc] || { label: svc.toUpperCase(), exposed: null, internal: null, why: '' };
       let sev = exposed ? info.exposed : info.internal;
@@ -261,7 +262,6 @@ function auditInterfaces(rows, stats = new Map()) {
       }
       return { service: svc, label: info.label, severity: sev };
     });
-    const st = stats.get(i.name) || null;
     const errors = st ? (st.rxErrors || 0) + (st.txErrors || 0) : 0;
     const packets = st ? (st.rxPackets || 0) + (st.txPackets || 0) : 0;
     // Erros acima de 0,1% dos pacotes costumam indicar cabo, duplex ou óptico ruim.

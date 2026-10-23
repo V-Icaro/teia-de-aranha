@@ -101,12 +101,14 @@ function FindingBody({ finding, target, onOpenPolicy, onCopy }) {
         <div className="fga-evidence">
           <h5>Tráfego real observado nesta política</h5>
           {loadingTraffic && <p className="hint">Carregando…</p>}
-          {traffic && (
+          {traffic && (traffic.srcIps?.length || traffic.dstIps?.length || traffic.services?.length) ? (
             <ul>
               <li>Origens mais frequentes: {traffic.srcIps?.length ? traffic.srcIps.map((r) => `${r.srcip} (${r.hits})`).join(', ') : 'nenhuma'}</li>
               <li>Destinos mais frequentes: {traffic.dstIps?.length ? traffic.dstIps.map((r) => `${r.dstip} (${r.hits})`).join(', ') : 'nenhuma'}</li>
               <li>Serviços: {traffic.services?.length ? traffic.services.map((r) => `${r.service || '—'} (${r.hits})`).join(', ') : 'nenhum'}</li>
             </ul>
+          ) : (
+            <p className="hint">Coleta de tráfego desativada ou sem registros para esta policy.</p>
           )}
         </div>
       )}
