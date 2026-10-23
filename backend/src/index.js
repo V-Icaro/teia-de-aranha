@@ -409,6 +409,32 @@ app.get('/api/fortigate/:id/audit', async (req, res) => {
 // Histórico persistido de eventos de administradores. Filtros: fortigateId,
 // user, action ('outro' = sem ação), status (success|failure), from, to (ISO),
 // q (texto livre), limit, offset.
+app.post('/api/fortigate-traffic/collect', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const fgTraffic = require('./fortigate-traffic');
+    const out = await fgTraffic.collectAll();
+    res.json({ results: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Falha na coleta de tráfego' });
+  }
+});
+
+app.get('/api/fortigate/:id/traffic', async (req, res) => {
+  try {
+    if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });
+    const fgTraffic = require('./fortigate-traffic');
+    await fgTraffic.ensureSchema();
+    const policyId = req.query.policyId ? Number(req.query.policyId) : null;
+    const data = await fgTraffic.queryTrafficByPolicy({ fortigateId: Number(req.params.id), policyId, limit: Number(req.query.limit) || 50 });
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Falha ao consultar tráfego' });
+  }
+});
+
 app.get('/api/fortigate-events', async (req, res) => {
   try {
     if (!(await dbInit())) return res.status(503).json({ error: 'Postgres indisponível' });

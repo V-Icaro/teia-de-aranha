@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { fmtBytes } from '../api.js';
 
 // Análise inteligente das políticas de um FortiGate: visão geral (nota,
@@ -76,7 +76,18 @@ function ScoreRing({ score }) {
   );
 }
 
-function FindingBody({ finding, onOpenPolicy, onCopy }) {
+function FindingBody({ finding, target, onOpenPolicy, onCopy }) {
+  const [traffic, setTraffic] = useState(null);
+  const [loadingTraffic, setLoadingTraffic] = useState(false);
+  useEffect(() => {
+    if (!target?.id || !finding?.policyid) return;
+    setLoadingTraffic(true);
+    fetch(`/api/fortigate/${target.id}/traffic?policyId=${finding.policyid}&limit=8`, { credentials: 'include' })
+      .then((r) => r.json())
+      .then((d) => setTraffic(d))
+      .catch(() => setTraffic(null))
+      .finally(() => setLoadingTraffic(false));
+  }, [target?.id, finding?.policyid]);
   return (
     <div className="fga-detail">
       <div className="fga-detail-grid">
@@ -85,6 +96,19 @@ function FindingBody({ finding, onOpenPolicy, onCopy }) {
       </div>
       {!!finding.evidence?.length && (
         <div className="fga-evidence"><h5>Evidências</h5><ul>{finding.evidence.map((line, i) => <li key={i}>{line}</li>)}</ul></div>
+      )}
+      {(loadingTraffic || traffic) && (
+        <div className="fga-evidence">
+          <h5>Tráfego real observado nesta política</h5>
+          {loadingTraffic && <p className="hint">Carregando…</p>}
+          {traffic && (
+            <ul>
+              <li>Origens mais frequentes: {traffic.srcIps?.length ? traffic.srcIps.map((r) => `${r.srcip} (${r.hits})`).join(', ') : 'nenhuma'}</li>
+              <li>Destinos mais frequentes: {traffic.dstIps?.length ? traffic.dstIps.map((r) => `${r.dstip} (${r.hits})`).join(', ') : 'nenhuma'}</li>
+              <li>Serviços: {traffic.services?.length ? traffic.services.map((r) => `${r.service || '—'} (${r.hits})`).join(', ') : 'nenhum'}</li>
+            </ul>
+          )}
+        </div>
       )}
       <div className="fga-detail-foot">
         <div className="fga-tags">
@@ -185,7 +209,7 @@ export default function FortigateAnalysis({ target, analysis, loading, error, st
           </span>
         </button>
         <p className="fga-problem">{f.problem}</p>
-        {open && <FindingBody finding={f} onOpenPolicy={onOpenPolicy} onCopy={copy} />}
+        {open && <FindingBody finding={f} target={target} onOpenPolicy={onOpenPolicy} onCopy={copy} />}
       </article>
     );
   };
